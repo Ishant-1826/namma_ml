@@ -1,11 +1,11 @@
 # Project State -- Namma Space
 
-> Last updated: 2026-10-20
+> Last updated: 2026-10-22
 
 ## What Is Done
 
 - [x] Repository scaffolded (directory structure, AGENTS.md, configs, docs).
-- [x] Initial commit `phase 0` pushed to GitHub remote `Roomverse_Namma_Space`.
+- [x] Pushed to GitHub remote `origin`: `https://github.com/Ishant-1826/nammaspace.git`.
 - [x] `requirements.txt` created and dependencies installed in `.venv`.
 - [x] `docs/COMPETITION.md` written detailing Techfest Round 1 rules, deliverables, criteria, and dates.
 - [x] `AGENTS.md` updated with Rule 10 on competition scope/priority alignment.

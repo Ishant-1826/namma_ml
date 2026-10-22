@@ -1,0 +1,42 @@
+# === Data & outputs (large, scene-specific) ===
+data/
+outputs/
+colmap_runs/
+tools/
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# === Node / Vite ===
+viewer/node_modules/
+viewer/dist/
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === Jupyter ===
+.ipynb_checkpoints/
+
+# === Misc ===
+*.log
+*.mp4
+*.mov
+*.avi
+*.db
+*.db-shm
+*.db-wal

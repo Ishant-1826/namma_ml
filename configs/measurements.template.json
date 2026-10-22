@@ -1,0 +1,21 @@
+{
+  "scene_name": "sample_room_corridor",
+  "ceiling_height_m": 2.75,
+  "measurements": [
+    {
+      "name": "room_length_axis_1",
+      "description": "Baseboard to baseboard distance along the longest wall (e.g., North-South)",
+      "metres": 5.42
+    },
+    {
+      "name": "room_width_axis_2",
+      "description": "Baseboard to baseboard distance along perpendicular wall (e.g., East-West)",
+      "metres": 3.86
+    },
+    {
+      "name": "corridor_length_axis_3",
+      "description": "Corridor length from room doorway threshold to corridor end wall",
+      "metres": 6.15
+    }
+  ]
+}

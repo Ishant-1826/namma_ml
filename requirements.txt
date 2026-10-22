@@ -1,0 +1,11 @@
+# Namma Space — Python dependencies
+opencv-python>=4.8
+numpy>=1.24
+open3d>=0.18
+pyyaml>=6.0
+tqdm>=4.65
+Pillow>=10.0
+trimesh>=4.0
+scikit-image>=0.21
+# pycolmap — install separately; needs COLMAP C++ libs on the system
+# pip install pycolmap   (may fail without a working COLMAP build)

@@ -1,0 +1,30 @@
+{
+  "path": [
+    [0.0, 0.0],
+    [0.0, 2.5],
+    [-3.5, 2.5],
+    [-3.5, 0.4],
+    [0.0, 0.4],
+    [0.0, 0.0]
+  ],
+  "turns": "L,L,L",
+  "hall_outline": [
+    [-4.2, -0.4],
+    [1.1, -0.4],
+    [1.1, 3.5],
+    [-4.2, 3.5]
+  ],
+  "landmarks": {
+    "table_north": [[-1.8, 2.7], [0.8, 3.3]],
+    "table_south": [[-3.3, -0.3], [-1.5, 0.3]],
+    "chairs_north": [[-3.2, 2.7], [-2.0, 3.3]],
+    "chairs_west": [[-4.0, 0.6], [-3.6, 2.2]],
+    "chair_east": [[0.4, 1.0], [0.9, 1.6]],
+    "door": [[-0.3, -0.4], [0.8, 0.0]]
+  },
+  "_notes": {
+    "units": "sketch units (proportions only, not metres)",
+    "origin": "start point in front of the door",
+    "description": "2 tables, 5 chairs, 1 door; closed counter-clockwise rectangular loop (L, L, L)"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "timestamp": "2026-10-22T09:57:45.772744+00:00",
+  "stage": "failed",
+  "progress": "Quality gate failure: 0.9% registered (required 85%)",
+  "done": true,
+  "error": "Quality gate failure"
+}

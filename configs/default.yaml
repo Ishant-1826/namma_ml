@@ -1,0 +1,57 @@
+# Namma Space — default pipeline config
+# Override per-scene by passing --config <path>
+
+scene: "sample"          # scene name → data/<scene>/, outputs/<scene>/
+
+# ── Frame Extraction ─────────────────────────────────────────
+extract_frames:
+  fps: 3                        # frames per second to extract via ffmpeg
+  quality: 95                   # JPEG quality (1-100)
+  max_dimension: 1920           # resize longest edge (null = no resize)
+  window_size: 1                # window size 1 to preserve dense continuous turnarounds
+  blur_percentile: 10.0         # drop only the bottom 10% blurriest frames
+  duplicate_threshold: 0.985    # SSIM threshold to drop near-duplicate stationary frames
+  max_frames: 450               # cap final frame count by uniform subsampling
+  min_frames_warn: 120          # warn if final frame count falls below 120
+  contact_sheet_cols: 8         # contact sheet grid columns
+  contact_sheet_rows: 6         # contact sheet grid rows
+
+# ── Structure-from-Motion (COLMAP) ───────────────────────────
+sfm:
+  camera_model: "OPENCV"        # OPENCV (default) | SIMPLE_RADIAL | PINHOLE
+  use_gpu: true
+  matcher: "sequential"         # sequential (with loop detection) | exhaustive when <= 300
+  mapper: "incremental"         # global (global_mapper) | incremental (mapper)
+  min_registered_ratio: 0.85    # minimum registration fraction to pass (85%)
+  feature_type: "SIFT"          # SIFT (default) | ALIKED
+  sequential_overlap: 20        # overlap for sequential matcher
+
+# ── Gravity / Scale Alignment ────────────────────────────────
+alignment:
+  method: "gravity"            # gravity | manual
+  phone_height_m: 1.45         # default assumed camera height above floor in metres
+  scale_reference_m: null      # known distance in metres (null = auto)
+  ceiling_height_m: 4.10       # ground truth ceiling height in metres (crop height in Phase 6)
+
+# ── Gaussian Splat Training ──────────────────────────────────
+splat:
+  backend: "brush"              # nerfstudio (ns-train splatfacto, CUDA) | brush (no CUDA)
+  preset: "fast"                # fast (7k steps smoke test) | final (30k steps, SH degree 3)
+  eval_ratio: 0.1               # hold out ~10% of frames for PSNR/SSIM/LPIPS evaluation
+  iterations: 30000
+  sh_degree: 3
+  densify_until_iter: 15000
+  position_lr_init: 0.00016
+  scaling_lr: 0.005
+
+# ── Post-processing ─────────────────────────────────────────
+postprocess:
+  compress: true
+  max_gaussians: 2_000_000  # prune if above this count
+
+# ── Scene convention (do not change) ─────────────────────────
+convention:
+  up: "Y"
+  handedness: "right"
+  units: "metres"
+  floor_y: 0.0

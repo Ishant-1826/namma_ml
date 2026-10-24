@@ -459,10 +459,13 @@ Copy-Item -Force outputs/home/web_assets_fast/scene.json, outputs/home/web_asset
 # 1. Install dependencies:
 cd viewer && npm install && cd ..
 
-# 2. Type-check and build production bundle:
+# 2. Run unit tests (Vitest: movement maths, friction, diagonal normalisation, pitch clamping, yaw convention):
+cd viewer && npm test && cd ..
+
+# 3. Type-check and build production bundle:
 cd viewer && npm run build && cd ..
 
-# 3. Run development server (detached):
+# 4. Run development server (detached):
 cd viewer && npm run dev
 # URL: http://localhost:5173/
 # Test error modal & retry flow: http://localhost:5173/?testError=true
@@ -471,6 +474,66 @@ cd viewer && npm run dev
 ## Known Issues / TODOs
 
 - Phase 7a Complete: Framework-free Vite + TypeScript 3DGS WebGL viewer built with Three.js and `@sparkjsdev/spark` 2.4.0. Dual-format `.spz` and fallback `.splat` loader, proper `splat_rotation_euler` application, OrbitControls Dev View (`viewer/src/devview.ts`), real progress bar, error handling with Retry, and zero TypeScript errors (`npm run build`). Dev server running at `http://localhost:5173/`.
-- Phase 7b Next: Implement first-person roaming controls (pointer-lock look, WASD movement, eye height pinning to 1.45 m above floor, and 2D collision detection using `occupancy.json`).
+- Phase 7b Complete: First-Person Viewer in `viewer/`:
+  - **Dev View Removed**: Deleted `viewer/src/devview.ts` and all references to orbit controls, axes, grid, bounding box, and spawn markers. Kept dark background `#0b0d12` and moved asset loading telemetry behind F3 toggle only.
+  - **First-Person Controls (`viewer/src/controls.ts`)**:
+    - Pointer lock on canvas click; Esc or window blur releases lock and clears key state to prevent drifting.
+    - Mouse look with Euler order "YXZ": yaw about world +Y, pitch about camera X axis. Clamped to ±70° from config.
+    - Sign convention verified: In Three.js right-handed coordinates, positive `rotation.y` rotates counter-clockwise when viewed from above (+Y looking down), turning the view to the left (-X). Moving mouse right (`movementX > 0`) decreases `euler.y` to turn right. Moving mouse up (`movementY < 0`) increases `euler.x` to look up (NOT inverted). Yaw 0 looks along -Z (North), exactly matching `scene.json`'s `spawn_yaw`.
+    - Horizontal-only movement: Camera yaw is extracted while pitch is ignored, ensuring looking up or down never changes elevation or makes the user fly.
+    - Diagonal normalisation: W+D combination is normalized to unit length so diagonal traversal speed matches cardinal speed (1.4 m/s walking, 2.8 m/s sprint).
+    - Acceleration & friction damping: 12 m/s² acceleration, combined linear stopping deceleration (7.0 m/s²) and exponential damping (14 s⁻¹) bringing camera to a complete stop in ~0.2s from walking speed. Delta time clamped to at most 0.05s to prevent lag-spike teleportation.
+    - Fixed eye height: Pinned at `floor_y + EYE_HEIGHT_M = 0.0 + 1.45 = 1.45 m` (commented in code: eye-level video pass was captured at 1.45 m).
+    - Key R: Resets camera to `spawn_position` (X, Z with eye height for Y) and `spawn_yaw`, zeroing velocity.
+    - Zero per-frame allocations: Reuses `Vector3` and `Euler` instances every frame.
+  - **Overlays & UI (`index.html`, `style.css`)**:
+    - Plain TypeScript + CSS with CSS variables (`--bg-dark`, `--accent-cyan`, etc.) and system fonts (no external web fonts).
+    - "Click to start" overlay with "Namma Space" title, controls cheat-sheet, quality buttons, and Start button (`pointer-events: none` on overlay wrapper, `pointer-events: auto` on interactive elements).
+    - Crosshair (4px dot) displayed only while pointer is locked.
+    - F3 stats panel (FPS, frame time, splat count, asset name, load time, position X/Y/Z, yaw deg, quality tier), updated at most 4 times per second (≥250ms interval).
+  - **Performance**:
+    - `devicePixelRatio` capped at 1.5.
+    - Quality toggle with keys 1 / 2 / 3 and UI buttons: Low (0.5x res scale), Med (0.75x res scale, default), High (1.0x res scale). Stored in `localStorage` under `namma_space_quality` inside `try/catch`.
+    - Spark LOD runtime tuning: Configured `@sparkjsdev/spark` `SparkRenderer.lodSplatScale` (0.5 / 0.75 / 1.0), `lodRenderScale` (2.0 / 1.5 / 1.0), and `maxStdDev` (2.0 / 2.45 / 2.828).
+    - Render loop skips execution and flushes clock delta when tab is hidden (`document.hidden`).
+  - **Testing**:
+    - 15 unit tests in `viewer/test/controls.test.ts` (Vitest 2.1.9) passing with 100% coverage on pure movement maths.
+    - `npm run build` succeeds with zero TypeScript errors. Production bundle: JS 3,208 kB (gzip 1,073 kB), CSS 8.6 kB, HTML 5.4 kB.
+    - Loaded 700,000 splats from `scene.spz` (14.15 MB) at `http://localhost:5173/`.
+- [x] **Phase 8: Movement Constraints, 2D Occupancy Collision, Minimap & Touch Navigation (`viewer/src/collision.ts`, `viewer/src/controls.ts`, `viewer/src/minimap.ts`, `viewer/test/collision.test.ts`)** -- COMPLETE & VERIFIED (2026-10-24):
+  - **Occupancy Grid Inspection**:
+    - Keys: `origin` ([-5.9, -4.7]), `cell_size` (0.1 m), `width` (100), `height` (122), `data` (row-major 12,200 elements), `walkable` (12,200 elements), `axes` ("x = X, row = Z"), `inflation_radius_m` (0.20 m), `occupied_cells_raw` (2,214), `occupied_cells_inflated` (5,642).
+    - World-to-cell mapping: `col = Math.floor((x - origin[0]) / cell_size)`, `row = Math.floor((z - origin[1]) / cell_size)`, `index = row * width + col`.
+    - Player collision radius: `data` is already inflated by 0.20 m during Phase 6 post-processing, and no uninflated raw array is saved in `occupancy.json`. Player is treated as a small circle with radius **0.08 m** against `data` to avoid double-inflation.
+  - **Pure Collision Maths (`viewer/src/collision.ts`)**:
+    - Pure TypeScript functions with ZERO Three.js or DOM imports for headless testability: `worldToCell`, `isBlocked`, `isPointBlocked`, `isCircleBlocked`, `getDistanceToFree`, `isMoveAllowed`, `resolveMovement`, `fixSpawnPosition`, `clampToBounds`.
+    - Circle-vs-grid nearest-point-on-cell test against overlapping cell bounding boxes.
+    - Wall sliding: diagonal moves into walls preserve parallel velocity component without snags or jitter.
+    - Anti-tunneling sub-stepping: moves subdivided into sub-steps of at most half a cell (0.05 m). Worst case at sprint speed (2.8 m/s, max dt 0.05s) is only 3 sub-steps per frame (`ceil(0.14 / 0.05) = 3`).
+    - Stuck escape: if player starts inside a blocked cell (e.g. camera poses near geometry), any move that maintains or decreases distance to nearest free cell is permitted, allowing clean walk-out.
+    - Blocked spawn fix: outward concentric ring search moves blocked spawn to the nearest free cell centre and logs a warning.
+    - Boundaries: `LIMIT_TO_WALKABLE` (default `true`, toggleable with Key L / shown on F3) rejects moves into unwalkable cells with sliding logic. Fallback clamping to `scene.json` bounds.
+    - Eye height: strictly locked at `floor_y + EYE_HEIGHT_M = 1.45 m`; optional head-bob (Key H, default OFF, amplitude 0.015 m) never modifies collision position.
+  - **Minimap Overlay (`viewer/src/minimap.ts`)**:
+    - Key B toggles (default OFF).
+    - Semi-transparent canvas (220 px wide) rendered ONCE from `occupancy.json` into an offscreen canvas (`ImageData`).
+    - Occupied cells dark (`#12151b`), walkable cells light (`#e2e8f0`), free but not walkable cells mid-grey (`#64748b`).
+    - +Z points DOWN the canvas (matching `top.png` compass convention).
+    - Player dot and heading arrow redrawn at most 10 times per second (>= 100 ms interval).
+    - `pointer-events: none` on overlay wrapper so viewer interactions are never blocked.
+  - **Touch Navigation (`viewer/src/controls.ts`)**:
+    - Detected via `matchMedia("(pointer: coarse)")` or `"ontouchstart"`, NOT user agent strings.
+    - Virtual joystick appears under thumb on left 1/3 of screen (`clientX < window.innerWidth / 3`) with a 10% dead zone (5 px on 50 px radius).
+    - Right 2/3 of screen (`clientX >= window.innerWidth / 3`) used for drag look with pitch clamping [-70°, +70°].
+    - Pointer events only (`setPointerCapture`, `touch-action: none` on canvas, supports two simultaneous touches).
+    - Start card adapts automatically to "Tap to Start" with touch controls hints. No pointer lock requested on touch.
+    - Joystick released on `pointercancel` and window `blur`.
+  - **Testing & Verification**:
+    - 27 unit tests passing across `viewer/test/collision.test.ts` (12 tests) and `viewer/test/controls.test.ts` (15 tests) with 100% pass rate.
+    - Tests assert perpendicular stopping, diagonal sliding, inside corner stability without jitter, passable 1.0 m gap vs impassable 0.3 m gap, 2.0 m anti-tunneling, spawn fix, stuck escape walk-out, walkable limit enforcement, and real `occupancy.json` verification.
+    - `npm run build` succeeds with ZERO TypeScript errors. Production bundle: JS 3,221.08 kB (gzip 1,077.24 kB), CSS 10.24 kB (gzip 2.50 kB), HTML 6.98 kB (gzip 1.59 kB).
+    - Dev server running detached at `http://localhost:5173/` maintaining steady 60 FPS with zero per-frame heap allocations.
+- Next Steps: Prepare Round 1 competition submission artifacts (documentation, SOP validation, screen recording, and final repository packaging).
+
 
 

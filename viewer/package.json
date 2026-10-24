@@ -6,11 +6,13 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run"
   },
   "devDependencies": {
     "typescript": "^5.4",
-    "vite": "^5.4"
+    "vite": "^5.4",
+    "vitest": "^2.1.9"
   },
   "dependencies": {
     "@sparkjsdev/spark": "^2.4.0",

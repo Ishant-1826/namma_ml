@@ -2,39 +2,157 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Namma Space — 3D Gaussian Splat Viewer (Phase 7a)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>Namma Space — 3D Gaussian Splat Explorer</title>
   <link rel="stylesheet" href="/src/style.css" />
 </head>
 <body>
   <!-- WebGL Canvas Container -->
   <div id="canvas-container"></div>
 
-  <!-- HUD Overlay -->
-  <div id="hud">
-    <div class="hud-title-row">
-      <div class="hud-title">
-        <span>Namma Space</span>
+  <!-- In-Game Crosshair (shown only when locked) -->
+  <div id="crosshair"></div>
+
+  <!-- Minimap Container (Key B toggles, default OFF, pointer-events: none) -->
+  <div id="minimap-container" class="hidden">
+    <div class="minimap-header">
+      <span class="minimap-title">FLOOR PLAN</span>
+      <span class="minimap-badge">Key B</span>
+    </div>
+  </div>
+
+  <!-- Virtual Touch Joystick (Touch devices only, under thumb) -->
+  <div id="joystick-container" class="hidden">
+    <div id="joystick-base">
+      <div id="joystick-thumb"></div>
+    </div>
+  </div>
+
+  <!-- F3 Telemetry & Stats Panel -->
+  <div id="stats-panel" class="hidden">
+    <div class="stats-header">
+      <span class="stats-title">TELEMETRY</span>
+      <span class="stats-badge">F3</span>
+    </div>
+    <div class="stats-grid">
+      <div class="stats-item">
+        <span class="stats-label">FPS:</span>
+        <span class="stats-value" id="stats-fps">—</span>
       </div>
-      <div class="hud-badge" id="hud-format">LOADING</div>
+      <div class="stats-item">
+        <span class="stats-label">Frame Time:</span>
+        <span class="stats-value" id="stats-frametime">—</span>
+      </div>
+      <div class="stats-item">
+        <span class="stats-label">Splat Count:</span>
+        <span class="stats-value" id="stats-splats">—</span>
+      </div>
+      <div class="stats-item">
+        <span class="stats-label">Asset:</span>
+        <span class="stats-value" id="stats-file">—</span>
+      </div>
+      <div class="stats-item">
+        <span class="stats-label">Load Time:</span>
+        <span class="stats-value" id="stats-loadtime">—</span>
+      </div>
+      <div class="stats-item">
+        <span class="stats-label">Position:</span>
+        <span class="stats-value" id="stats-pos">—</span>
+      </div>
+      <div class="stats-item">
+        <span class="stats-label">Yaw:</span>
+        <span class="stats-value" id="stats-yaw">—</span>
+      </div>
+      <div class="stats-item">
+        <span class="stats-label">Quality:</span>
+        <span class="stats-value" id="stats-quality">—</span>
+      </div>
+      <div class="stats-item">
+        <span class="stats-label">Walkable Limit:</span>
+        <span class="stats-value" id="stats-walkable">ON</span>
+      </div>
+      <div class="stats-item">
+        <span class="stats-label">Collision:</span>
+        <span class="stats-value" id="stats-collision">ON (r=0.08m)</span>
+      </div>
+      <div class="stats-item">
+        <span class="stats-label">Head-Bob:</span>
+        <span class="stats-value" id="stats-headbob">OFF (Key H)</span>
+      </div>
+      <div class="stats-item">
+        <span class="stats-label">Minimap:</span>
+        <span class="stats-value" id="stats-minimap">OFF (Key B)</span>
+      </div>
     </div>
-    <div class="hud-item">
-      <span class="hud-label">Asset:</span>
-      <span class="hud-value" id="hud-file">—</span>
+  </div>
+
+  <!-- Start & Controls Overlay (shown when unlocked) -->
+  <div id="start-overlay">
+    <div class="start-card">
+      <div class="start-header">
+        <div class="start-title-row">
+          <h1 class="start-title">Namma Space</h1>
+          <span class="start-badge">Phase 8</span>
+        </div>
+        <p class="start-subtitle">First-Person 3D Gaussian Splat Explorer with Collision Constraints</p>
+      </div>
+
+      <div class="controls-card">
+        <div class="controls-header">Controls</div>
+        <div class="controls-list" id="controls-list">
+          <div class="control-row">
+            <span class="key-badge">WASD / Arrows</span>
+            <span class="control-desc">Move (Wall sliding & anti-tunneling)</span>
+          </div>
+          <div class="control-row">
+            <span class="key-badge">Mouse</span>
+            <span class="control-desc">Look around (Yaw + Pitch)</span>
+          </div>
+          <div class="control-row">
+            <span class="key-badge">Shift</span>
+            <span class="control-desc">Sprint (2x speed, 2.8 m/s)</span>
+          </div>
+          <div class="control-row">
+            <span class="key-badge">B</span>
+            <span class="control-desc">Toggle minimap floor plan</span>
+          </div>
+          <div class="control-row">
+            <span class="key-badge">H</span>
+            <span class="control-desc">Toggle head-bob (0.015 m)</span>
+          </div>
+          <div class="control-row">
+            <span class="key-badge">R</span>
+            <span class="control-desc">Reset to spawn & yaw</span>
+          </div>
+          <div class="control-row">
+            <span class="key-badge">1 / 2 / 3</span>
+            <span class="control-desc">Quality: Low / Med / High</span>
+          </div>
+          <div class="control-row">
+            <span class="key-badge">F3</span>
+            <span class="control-desc">Toggle telemetry stats</span>
+          </div>
+          <div class="control-row">
+            <span class="key-badge">Esc</span>
+            <span class="control-desc">Release cursor</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="quality-section">
+        <div class="quality-label">Render Quality:</div>
+        <div class="quality-btn-group">
+          <button type="button" class="quality-btn" data-quality="low" id="btn-quality-low">1 Low</button>
+          <button type="button" class="quality-btn active" data-quality="med" id="btn-quality-med">2 Med</button>
+          <button type="button" class="quality-btn" data-quality="high" id="btn-quality-high">3 High</button>
+        </div>
+      </div>
+
+      <button type="button" class="start-button" id="start-btn">
+        <span class="start-btn-text" id="start-btn-title">Click to Start</span>
+        <span class="start-btn-sub" id="start-btn-sub">Or click anywhere on the screen</span>
+      </button>
     </div>
-    <div class="hud-item">
-      <span class="hud-label">Load Time:</span>
-      <span class="hud-value" id="hud-time">—</span>
-    </div>
-    <div class="hud-item">
-      <span class="hud-label">Splat Count:</span>
-      <span class="hud-value" id="hud-splats">—</span>
-    </div>
-    <div class="hud-item">
-      <span class="hud-label">Euler Rotation:</span>
-      <span class="hud-value" id="hud-rot">[0, 0, 0]</span>
-    </div>
-    <div class="hud-hint">Left Drag: Orbit • Right Drag: Pan • Scroll: Zoom</div>
   </div>
 
   <!-- Loading Overlay -->
@@ -56,7 +174,7 @@
       <div class="error-title">Asset Loading Failed</div>
       <div class="error-message" id="error-message">Could not load Gaussian splat file.</div>
       <div class="error-url-box" id="error-url">URL</div>
-      <button class="retry-button" id="retry-btn">Retry Loading</button>
+      <button type="button" class="retry-button" id="retry-btn">Retry Loading</button>
     </div>
   </div>
 

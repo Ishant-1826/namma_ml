@@ -3,14 +3,63 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Namma Space — 3D Viewer</title>
-  <style>
-    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #111; }
-    #app { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; color: #aaa; font-family: monospace; }
-  </style>
+  <title>Namma Space — 3D Gaussian Splat Viewer (Phase 7a)</title>
+  <link rel="stylesheet" href="/src/style.css" />
 </head>
 <body>
-  <div id="app">Namma Space viewer — not yet implemented.</div>
+  <!-- WebGL Canvas Container -->
+  <div id="canvas-container"></div>
+
+  <!-- HUD Overlay -->
+  <div id="hud">
+    <div class="hud-title-row">
+      <div class="hud-title">
+        <span>Namma Space</span>
+      </div>
+      <div class="hud-badge" id="hud-format">LOADING</div>
+    </div>
+    <div class="hud-item">
+      <span class="hud-label">Asset:</span>
+      <span class="hud-value" id="hud-file">—</span>
+    </div>
+    <div class="hud-item">
+      <span class="hud-label">Load Time:</span>
+      <span class="hud-value" id="hud-time">—</span>
+    </div>
+    <div class="hud-item">
+      <span class="hud-label">Splat Count:</span>
+      <span class="hud-value" id="hud-splats">—</span>
+    </div>
+    <div class="hud-item">
+      <span class="hud-label">Euler Rotation:</span>
+      <span class="hud-value" id="hud-rot">[0, 0, 0]</span>
+    </div>
+    <div class="hud-hint">Left Drag: Orbit • Right Drag: Pan • Scroll: Zoom</div>
+  </div>
+
+  <!-- Loading Overlay -->
+  <div id="loading-overlay">
+    <div class="loading-card">
+      <div class="spinner"></div>
+      <div class="loading-title">Loading 3D Gaussian Splat</div>
+      <div class="loading-subtitle" id="loading-subtitle">Initializing...</div>
+      <div class="progress-track" id="progress-track">
+        <div class="progress-bar" id="progress-bar"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Error Overlay -->
+  <div id="error-overlay" class="hidden">
+    <div class="error-card">
+      <div class="error-icon">!</div>
+      <div class="error-title">Asset Loading Failed</div>
+      <div class="error-message" id="error-message">Could not load Gaussian splat file.</div>
+      <div class="error-url-box" id="error-url">URL</div>
+      <button class="retry-button" id="retry-btn">Retry Loading</button>
+    </div>
+  </div>
+
   <script type="module" src="/src/main.ts"></script>
 </body>
 </html>

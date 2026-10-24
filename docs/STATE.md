@@ -324,7 +324,39 @@
     - Final 700k: Umeyama yaw = -0.00°, trans = 0.0003 m, scale = 0.9999, floor peak = -0.050 m, floor tilt = 0.61°, camera inclusion = 100.0% -> **PASS**.
   - Deployed `final_700k` assets (`scene.json`, `scene.splat`, `scene.spz`, `occupancy.json`, `occupancy.png`) to `viewer/public/scene/`.
     - Preserved exact eye height (1.45 m above floor at y = 0.0), spawn position `[1.771, 1.450, 3.523]`, spawn yaw `-0.0426` rad (`-2.44°`), and `splat_rotation_euler` (`[0.0, 0.0, 0.0]`).
-- [ ] Web Viewer (`viewer/`): Interactive first-person 3DGS roaming web viewer.
+- [x] **Phase 7a: Framework-Free WebGL 3DGS Viewer (`viewer/`, Three.js + Spark)** -- COMPLETE & VERIFIED (2026-10-24):
+  - **Framework-Free Vanilla Architecture**:
+    - Vite + TypeScript vanilla app (`viewer/`) built without React, Tailwind, or external UI frameworks.
+    - Pure CSS styling with dark theme (`#0b0d12`), responsive canvas, and glassmorphic HUD.
+  - **Spark Package & API Audit (`@sparkjsdev/spark`)**:
+    - **Spark Version**: `2.4.0`.
+    - **Three.js Compatibility**: `peerDependencies` requires `three >= 0.180.0` (`devDependencies` pins `^0.180.0`). Installed `three: 0.186.1` and `@types/three: 0.186.0`.
+    - **Splat Loading API**: High-level `SplatMesh({ url, onProgress, onLoad })` extending Three.js `SplatGenerator`/`Object3D`. Integrated with `SparkRenderer({ renderer })` added to the `THREE.Scene`. Also provides lower-level `SplatLoader` extending `THREE.Loader`.
+    - **Progress Observation**: Real progress events supported via `onProgress: (event: ProgressEvent) => void`. Spark's worker reports `{ loaded, total }` during download and decoding, enabling genuine percentage and loaded/total MB tracking.
+    - **Format Support**: Both `.spz` and `.splat` (alongside `.ply`, `.ksplat`, `.sog`, and `.rad`) are natively supported through `SplatFileType.SPZ` and `SplatFileType.SPLAT`.
+  - **Asset Loading & Dual-Format Fallback**:
+    - Asset base configurable via `VITE_ASSET_BASE` (`.env.example` added; defaults to empty string for same-origin).
+    - Fetches `scene.json` first, extracting bounds, floor/ceiling elevations, spawn position, spawn yaw, rotation euler, and splat files.
+    - Primary format: loads `.spz` first (`scene.spz`, 13.49 MB).
+    - Automatic fallback: if `.spz` fails, logs warning and seamlessly loads `.splat` (`scene.splat`, 21.36 MB).
+    - Rotation integrity: Strictly applies `splat_rotation_euler` (`[0, 0, 0]`) to the splat mesh as a proper Euler rotation without axis flipping or mirroring.
+  - **Dev-Only Check View (`viewer/src/devview.ts`)**:
+    - Self-contained in a single modular file for clean deletion in Phase 7b.
+    - OrbitControls targeting the centroid of `scene.json` bounds.
+    - Camera placed 8 m back (+Z) and 5 m up (+Y) from center so full hall is in view.
+    - 1 m floor grid snapped to `y = floor_y` (0.0 m).
+    - 1 m axes helper at origin (X red, Y green, Z blue).
+    - Labelled marker at `spawn_position` with floor ring, vertical stem, canvas text sprite, and heading arrow along `spawn_yaw` (yaw 0 looks along -Z, CCW seen from above).
+    - Semi-transparent box with wireframe outline visualizing `scene.json` bounds.
+    - Dark background `#0b0d12`.
+  - **Loading UI, Error Resilience & Performance**:
+    - Progress bar displaying exact percentage and MB downloaded.
+    - Full error overlay showing exact attempted URL and interactive Retry button (supports interactive testing via `?testError=true`).
+    - Performance: `devicePixelRatio` capped at 1.5, `antialias: false` for Gaussian splat rasterization performance, zero per-frame heap allocations in animation loop.
+    - Splat count verified: logs loaded count (`700,000`) and confirms exact match with `scene.json`.
+    - Build: `npm run build` (`tsc && vite build`) passes with ZERO TypeScript errors.
+    - Dev server running detached at `http://localhost:5173/`.
+- [ ] Phase 7b: First-person WASD + pointer-lock roaming controls, eye-height maintenance, and 2D occupancy grid collision detection.
 
 
 ## How to Run
@@ -422,10 +454,23 @@ Copy-Item -Force outputs/home/final_full/scene.json, outputs/home/final_full/sce
 Copy-Item -Force outputs/home/web_assets_fast/scene.json, outputs/home/web_assets_fast/scene.splat, outputs/home/web_assets_fast/scene.spz, outputs/home/web_assets_fast/occupancy.json, outputs/home/web_assets_fast/occupancy.png viewer/public/scene/
 # Bash:
 # cp outputs/home/web_assets_fast/{scene.json,scene.splat,scene.spz,occupancy.json,occupancy.png} viewer/public/scene/
+
+# --- PHASE 7: 3DGS WEB VIEWER ---
+# 1. Install dependencies:
+cd viewer && npm install && cd ..
+
+# 2. Type-check and build production bundle:
+cd viewer && npm run build && cd ..
+
+# 3. Run development server (detached):
+cd viewer && npm run dev
+# URL: http://localhost:5173/
+# Test error modal & retry flow: http://localhost:5173/?testError=true
 ```
 
 ## Known Issues / TODOs
 
-- Stage 5 Post-Processing & Model Comparison: Complete. Full 30k model (824,903 splats) and 700k budgeted model (700,000 splats) generated and audited against the 7k model (383,101 splats). All coordinate verifications pass. 700k variant deployed to `viewer/public/scene/`.
-- Phase 7: Implement interactive first-person WebGL/WebGPU 3DGS roaming viewer in `viewer/` loading `viewer/public/scene/scene.json` (`scene.spz` / `scene.splat`).
+- Phase 7a Complete: Framework-free Vite + TypeScript 3DGS WebGL viewer built with Three.js and `@sparkjsdev/spark` 2.4.0. Dual-format `.spz` and fallback `.splat` loader, proper `splat_rotation_euler` application, OrbitControls Dev View (`viewer/src/devview.ts`), real progress bar, error handling with Retry, and zero TypeScript errors (`npm run build`). Dev server running at `http://localhost:5173/`.
+- Phase 7b Next: Implement first-person roaming controls (pointer-lock look, WASD movement, eye height pinning to 1.45 m above floor, and 2D collision detection using `occupancy.json`).
+
 

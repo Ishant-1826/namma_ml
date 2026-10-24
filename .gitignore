@@ -40,3 +40,7 @@ Thumbs.db
 *.db
 *.db-shm
 *.db-wal
+*.ply
+*.splat
+*.spz
+

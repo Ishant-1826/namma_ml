@@ -1,55 +1,46 @@
 #!/usr/bin/env python3
 """
-pipeline/align_scene.py  --  Stage 3: Metric, Gravity-Aligned, Y-up Floor Alignment.
+pipeline/align_scene.py  --  Phase 4: Metric, Gravity-Aligned, Y-up Scene Alignment.
 
 Converts a COLMAP sparse reconstruction into a metric, gravity-aligned,
 Y-up coordinate frame with the floor plane at y = 0 BEFORE Gaussian Splatting training.
 
-Key Stages:
------------
-1. Load sparse/0 (pycolmap if available, else robust COLMAP text parser).
-2. Floor detection: Iterative RANSAC plane fitting (Open3D segment_plane).
-   Selects the lowest large horizontal plane whose normal agrees with the
-   mean camera up vector, with cameras verified to be strictly above the floor.
-   Fails with an actionable error message if inliers are insufficient.
-3. Rigid Rotation & Translation:
-   Rotates floor normal to +Y (proper SO(3) rotation with det = +1), aligns
-   dominant room walls axis-aligned with Leg 1 heading North (-Z), and
-   translates the scene so the floor plane lies at y = 0.0.
-4. Metric Scaling:
-   - Mode (a) Default: Scales the model so the mean camera height above floor
-     equals the assumed smartphone capture height (config, default 1.45 m).
-   - Mode (b): Scales according to a user-supplied metric distance between two
-     point IDs or coordinates.
-   - Compares implied ceiling height and room extents against measurements.json.
-5. Outputs:
-   - data/<scene>/colmap_aligned/ (cameras.txt, images.txt, points3D.txt)
-   - data/<scene>/transforms.json (Nerfstudio format in aligned frame, with
-     explicit COLMAP/OpenCV vs OpenGL camera axes conversion)
-   - data/<scene>/alignment.json (R, t, s, and detailed geometry statistics)
+RULES ENFORCED:
+- Every transform applied to data is a proper rotation (determinant +1),
+  plus one uniform scale and a translation. Never negates an axis.
+- Never moves, deletes, or re-orders camera poses or points.
+- Reads configs/default.yaml for all settings.
+- Robust to single or dual video passes (Eye level reference, Chest level check).
 
-Usage:
-------
-    python pipeline/align_scene.py --scene home
-    python pipeline/align_scene.py --scene home --phone-height 1.45
-    python pipeline/align_scene.py --scene home --scale-mode points --point-ids 10 25 --distance 2.45
+Outputs:
+  * data/<scene>/colmap_aligned/ (cameras.txt, images.txt, points3D.txt, cameras.bin, images.bin, points3D.bin)
+  * data/<scene>/transforms.json (Nerfstudio OpenGL aligned format)
+  * data/<scene>/alignment.json (R, t, s, up spread, floor plane, per-pass heights, room extents)
+  * data/<scene>/colmap_aligned/points3D.ply and data/<scene>/points3D.ply (sparse init point cloud)
 """
 
 import argparse
 import json
 import math
+import os
+import shutil
+import struct
+import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import yaml
+
 try:
     from pipeline.utils.point_cloud import o3d
 except ImportError:
-    import open3d as o3d
-import yaml
+    try:
+        import open3d as o3d
+    except ImportError:
+        o3d = None
 
-# Check for pycolmap availability
 try:
     import pycolmap
     HAS_PYCOLMAP = True
@@ -58,11 +49,10 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# I/O Helpers & Parsers
+# Configuration Loader
 # ---------------------------------------------------------------------------
 
 def load_config(path: str) -> dict:
-    """Load configuration YAML file."""
     p = Path(path)
     if not p.is_file():
         return {}
@@ -70,114 +60,12 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f) or {}
 
 
-def parse_cameras_txt(path: Path) -> dict:
-    cameras = {}
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split()
-            cam_id = int(parts[0])
-            cameras[cam_id] = {
-                "model": parts[1],
-                "width": int(parts[2]),
-                "height": int(parts[3]),
-                "params": [float(p) for p in parts[4:]],
-            }
-    return cameras
-
-
-def parse_images_txt(path: Path) -> dict:
-    """Parse COLMAP images.txt (2 lines per registered image)."""
-    images = {}
-    with open(path, "r", encoding="utf-8") as f:
-        lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-    i = 0
-    while i < len(lines):
-        parts = lines[i].split()
-        img_id = int(parts[0])
-        qw, qx, qy, qz = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
-        tx, ty, tz = float(parts[5]), float(parts[6]), float(parts[7])
-        cam_id = int(parts[8])
-        name = parts[9]
-        images[img_id] = {
-            "qw": qw, "qx": qx, "qy": qy, "qz": qz,
-            "tx": tx, "ty": ty, "tz": tz,
-            "camera_id": cam_id,
-            "name": name,
-            "point2d_str": lines[i + 1] if i + 1 < len(lines) else "",
-        }
-        i += 2
-    return images
-
-
-def parse_points3d_txt(path: Path) -> dict:
-    """Parse COLMAP points3D.txt."""
-    points = {}
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split()
-            pt_id = int(parts[0])
-            points[pt_id] = {
-                "xyz": np.array([float(parts[1]), float(parts[2]), float(parts[3])]),
-                "rgb": (int(parts[4]), int(parts[5]), int(parts[6])),
-                "error": float(parts[7]),
-                "track": " ".join(parts[8:]),
-            }
-    return points
-
-
-def write_cameras_txt(cameras: dict, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("# Camera list with one line of data per camera:\n")
-        f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
-        for cam_id, cam in sorted(cameras.items()):
-            params_str = " ".join(repr(p) for p in cam["params"])
-            f.write(f"{cam_id} {cam['model']} {cam['width']} {cam['height']} {params_str}\n")
-
-
-def write_images_txt(images: dict, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("# Image list with two lines of data per image:\n")
-        f.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
-        f.write("#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
-        for img_id, img in sorted(images.items()):
-            f.write(
-                f"{img_id}"
-                f" {img['qw']:.10f} {img['qx']:.10f}"
-                f" {img['qy']:.10f} {img['qz']:.10f}"
-                f" {img['tx']:.10f} {img['ty']:.10f} {img['tz']:.10f}"
-                f" {img['camera_id']} {img['name']}\n"
-            )
-            f.write(img["point2d_str"] + "\n")
-
-
-def write_points3d_txt(points: dict, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("# 3D point list with one line of data per point:\n")
-        f.write("#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[]\n")
-        for pt_id, pt in sorted(points.items()):
-            xyz = pt["xyz"]
-            r, g, b = pt["rgb"]
-            f.write(
-                f"{pt_id} {xyz[0]:.10f} {xyz[1]:.10f} {xyz[2]:.10f}"
-                f" {r} {g} {b} {pt['error']:.6f} {pt['track']}\n"
-            )
-
-
 # ---------------------------------------------------------------------------
-# 3D Geometry Utilities
+# Robust COLMAP I/O (TXT & Binary)
 # ---------------------------------------------------------------------------
 
-def quat_to_rot(qw: float, qx: float, qy: float, qz: float) -> np.ndarray:
-    """Hamilton quaternion (qw, qx, qy, qz) -> 3x3 rotation matrix."""
+def quat_to_rotmat(qw: float, qx: float, qy: float, qz: float) -> np.ndarray:
+    """Hamilton quaternion (qw, qx, qy, qz) -> 3x3 rotation matrix (world-from-camera or cam-from-world)."""
     return np.array([
         [1 - 2*(qy**2 + qz**2),     2*(qx*qy - qz*qw),     2*(qx*qz + qy*qw)],
         [    2*(qx*qy + qz*qw), 1 - 2*(qx**2 + qz**2),     2*(qy*qz - qx*qw)],
@@ -185,7 +73,7 @@ def quat_to_rot(qw: float, qx: float, qy: float, qz: float) -> np.ndarray:
     ])
 
 
-def rot_to_quat(R: np.ndarray) -> Tuple[float, float, float, float]:
+def rotmat_to_quat(R: np.ndarray) -> Tuple[float, float, float, float]:
     """Shepperd's method: 3x3 rotation matrix -> (qw, qx, qy, qz)."""
     trace = R[0, 0] + R[1, 1] + R[2, 2]
     if trace > 0:
@@ -215,229 +103,262 @@ def rot_to_quat(R: np.ndarray) -> Tuple[float, float, float, float]:
     return float(w), float(x), float(y), float(z)
 
 
-def rotation_align(v_src: np.ndarray, v_dst: np.ndarray) -> np.ndarray:
-    """
-    Computes a proper 3D rotation matrix (det = +1) mapping unit vector v_src
-    to unit vector v_dst via Rodrigues' formula.
-    """
+def rodrigues_align(v_src: np.ndarray, v_dst: np.ndarray) -> np.ndarray:
+    """Proper 3D rotation matrix (det = +1.0) mapping unit v_src to unit v_dst via Rodrigues' formula."""
     v_src = v_src / np.linalg.norm(v_src)
     v_dst = v_dst / np.linalg.norm(v_dst)
     cross = np.cross(v_src, v_dst)
     dot = float(np.dot(v_src, v_dst))
-    if abs(dot + 1.0) < 1e-8:  # 180-degree case
+    if abs(dot + 1.0) < 1e-8:  # 180-degree antipodal case
         perp = np.array([1., 0., 0.]) if abs(v_src[0]) < 0.9 else np.array([0., 1., 0.])
         axis = np.cross(v_src, perp)
         axis /= np.linalg.norm(axis)
         return 2.0 * np.outer(axis, axis) - np.eye(3)
     s = np.linalg.norm(cross)
+    if s < 1e-8:
+        return np.eye(3)
     kmat = np.array([
         [0., -cross[2], cross[1]],
         [cross[2], 0., -cross[0]],
         [-cross[1], cross[0], 0.],
     ])
-    return np.eye(3) + kmat + kmat @ kmat * (1.0 - dot) / (s * s)
+    R = np.eye(3) + kmat + kmat @ kmat * (1.0 - dot) / (s * s)
+    assert abs(np.linalg.det(R) - 1.0) < 1e-5, f"det(R) must be +1, got {np.linalg.det(R)}"
+    return R
 
+
+def parse_cameras_txt(path: Path) -> Dict[int, dict]:
+    cameras = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            cam_id = int(parts[0])
+            cameras[cam_id] = {
+                "model": parts[1],
+                "width": int(parts[2]),
+                "height": int(parts[3]),
+                "params": [float(p) for p in parts[4:]],
+            }
+    return cameras
+
+
+def parse_images_txt(path: Path) -> Dict[int, dict]:
+    images = {}
+    with open(path, "r", encoding="utf-8") as f:
+        lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+    i = 0
+    while i < len(lines):
+        parts = lines[i].split()
+        img_id = int(parts[0])
+        qw, qx, qy, qz = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+        tx, ty, tz = float(parts[5]), float(parts[6]), float(parts[7])
+        cam_id = int(parts[8])
+        name = parts[9]
+        images[img_id] = {
+            "qw": qw, "qx": qx, "qy": qy, "qz": qz,
+            "tx": tx, "ty": ty, "tz": tz,
+            "camera_id": cam_id,
+            "name": name,
+            "point2d_str": lines[i + 1] if i + 1 < len(lines) else "",
+        }
+        i += 2
+    return images
+
+
+def parse_points3d_txt(path: Path) -> Dict[int, dict]:
+    points = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            pt_id = int(parts[0])
+            points[pt_id] = {
+                "xyz": np.array([float(parts[1]), float(parts[2]), float(parts[3])]),
+                "rgb": (int(parts[4]), int(parts[5]), int(parts[6])),
+                "error": float(parts[7]),
+                "track": " ".join(parts[8:]),
+            }
+    return points
+
+
+def write_cameras_txt(cameras: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# Camera list with one line of data per camera:\n")
+        f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+        f.write(f"# Number of cameras: {len(cameras)}\n")
+        for cam_id, cam in sorted(cameras.items()):
+            params_str = " ".join(repr(p) for p in cam["params"])
+            f.write(f"{cam_id} {cam['model']} {cam['width']} {cam['height']} {params_str}\n")
+
+
+def write_images_txt(images: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# Image list with two lines of data per image:\n")
+        f.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
+        f.write("#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
+        f.write(f"# Number of images: {len(images)}\n")
+        for img_id, img in sorted(images.items()):
+            f.write(
+                f"{img_id}"
+                f" {img['qw']:.10f} {img['qx']:.10f}"
+                f" {img['qy']:.10f} {img['qz']:.10f}"
+                f" {img['tx']:.10f} {img['ty']:.10f} {img['tz']:.10f}"
+                f" {img['camera_id']} {img['name']}\n"
+            )
+            f.write(img.get("point2d_str", "") + "\n")
+
+
+def write_points3d_txt(points: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# 3D point list with one line of data per point:\n")
+        f.write("#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[]\n")
+        f.write(f"# Number of points: {len(points)}\n")
+        for pt_id, pt in sorted(points.items()):
+            xyz = pt["xyz"]
+            r, g, b = pt["rgb"]
+            f.write(
+                f"{pt_id} {xyz[0]:.10f} {xyz[1]:.10f} {xyz[2]:.10f}"
+                f" {r} {g} {b} {pt['error']:.6f} {pt.get('track', '')}\n"
+            )
+
+
+def write_points3d_ply(points: dict, path: Path) -> None:
+    """Save point cloud in PLY format for splat training."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    n_pts = len(points)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {n_pts}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write("end_header\n")
+        for pt in points.values():
+            xyz = pt["xyz"]
+            r, g, b = pt["rgb"]
+            f.write(f"{xyz[0]:.6f} {xyz[1]:.6f} {xyz[2]:.6f} {int(r)} {int(g)} {int(b)}\n")
+
+
+def convert_model_to_bin_if_possible(txt_dir: Path, bin_dir: Path) -> None:
+    """Export aligned TXT model to COLMAP binary files (cameras.bin, images.bin, points3D.bin)."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    if HAS_PYCOLMAP:
+        try:
+            rec = pycolmap.Reconstruction(str(txt_dir))
+            rec.write_binary(str(bin_dir))
+            return
+        except Exception:
+            pass
+
+    colmap_bin = shutil.which("colmap")
+    if colmap_bin:
+        try:
+            cmd = [
+                colmap_bin, "model_converter",
+                "--input_path", str(txt_dir),
+                "--output_path", str(bin_dir),
+                "--output_type", "BIN"
+            ]
+            subprocess.run(cmd, capture_output=True, check=True)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Camera Center & Helpers
+# ---------------------------------------------------------------------------
 
 def camera_centre(img: dict) -> np.ndarray:
-    """Compute camera center in world coordinates from COLMAP pose."""
-    R = quat_to_rot(img["qw"], img["qx"], img["qy"], img["qz"])
+    """Compute camera center in world coordinates from COLMAP pose: C = -R_wc.T @ t_wc."""
+    R = quat_to_rotmat(img["qw"], img["qx"], img["qy"], img["qz"])
     t = np.array([img["tx"], img["ty"], img["tz"]])
     return -(R.T @ t)
 
 
 def frame_number(name: str) -> int:
-    """Extract integer frame number from filename."""
     digits = "".join(filter(str.isdigit, name))
     return int(digits) if digits else 0
 
 
 # ---------------------------------------------------------------------------
-# Floor Plane Detection (Iterative Open3D RANSAC)
+# STEP 0: Find Input Model
 # ---------------------------------------------------------------------------
 
-def detect_floor_plane_iterative(
-    pts_xyz: np.ndarray,
-    cam_centres: np.ndarray,
-    mean_cam_up: np.ndarray,
-    dist_thresh: float = 0.08,
-    max_angle_deg: float = 8.0,
-    min_inliers: int = 150,
-    max_iterations: int = 25,
-) -> dict:
+def pick_best_colmap_model(repo_root: Path, scene: str, configured_model: Optional[str]) -> Path:
     """
-    Detects the floor plane via iterative Open3D segment_plane RANSAC.
-    
-    Selection Criteria:
-      1. Normal agrees with mean camera up vector within max_angle_deg.
-      2. Normal is oriented so cameras are above the floor (n @ cam_c + d > 0).
-      3. Large plane: meets min_inliers threshold.
-      4. Lowest plane: selects the plane with the lowest elevation (floor, not
-         tabletops, chair tops, or ceiling).
+    Finds the COLMAP model with the most registered images (config key: align.input_model).
     """
-    candidates = []
+    if configured_model:
+        p = Path(configured_model)
+        if not p.is_absolute():
+            p = repo_root / p
+        if (p / "cameras.txt").is_file() or (p / "cameras.bin").is_file():
+            return p
 
-    # 1. Iterative search on points below median camera height
-    # Floor geometry is always situated below cameras.
-    med_cam_h = float(np.median(cam_centres @ mean_cam_up))
-    pts_below = pts_xyz[(pts_xyz @ mean_cam_up) < med_cam_h] if len(pts_xyz) > 0 else pts_xyz
+    candidates: List[Path] = []
+    # 1. Search colmap_runs
+    colmap_runs = repo_root / "colmap_runs"
+    if colmap_runs.is_dir():
+        for exp in sorted(colmap_runs.iterdir()):
+            if exp.is_dir():
+                sparse = exp / "sparse"
+                if sparse.is_dir():
+                    for sub in sparse.iterdir():
+                        if sub.is_dir() and ((sub / "cameras.bin").is_file() or (sub / "cameras.txt").is_file()):
+                            candidates.append(sub)
 
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(pts_below)
-    curr_pcd = pcd
+    # 2. Search data/<scene>/colmap/sparse
+    data_sparse = repo_root / "data" / scene / "colmap" / "sparse"
+    if data_sparse.is_dir():
+        for sub in data_sparse.iterdir():
+            if sub.is_dir() and ((sub / "cameras.bin").is_file() or (sub / "cameras.txt").is_file()):
+                candidates.append(sub)
 
-    for i in range(max_iterations):
-        if len(curr_pcd.points) < 100:
-            break
-        plane_model, inliers = curr_pcd.segment_plane(
-            distance_threshold=dist_thresh,
-            ransac_n=3,
-            num_iterations=2000,
+    if not candidates:
+        raise RuntimeError(
+            f"No COLMAP models found in colmap_runs/ or data/{scene}/colmap/sparse/.\n"
+            "Actionable advice: Run Stage 2 SfM (pipeline/run_sfm.py) or specify --input-model."
         )
-        if len(inliers) < 80:
-            curr_pcd = curr_pcd.select_by_index(inliers, invert=True)
-            continue
 
-        nrm = np.array(plane_model[:3])
-        d = float(plane_model[3])
-        n_len = np.linalg.norm(nrm)
-        if n_len < 1e-7:
-            curr_pcd = curr_pcd.select_by_index(inliers, invert=True)
-            continue
-        nrm /= n_len
-        d /= n_len
+    # Rank by number of registered images
+    ranked = []
+    for c in candidates:
+        img_count = 0
+        txt_img = c / "images.txt"
+        bin_img = c / "images.bin"
+        if txt_img.is_file():
+            try:
+                with open(txt_img, "r", encoding="utf-8") as f:
+                    lines = [l for l in f if l.strip() and not l.startswith("#")]
+                img_count = len(lines) // 2
+            except Exception:
+                pass
+        elif bin_img.is_file() and HAS_PYCOLMAP:
+            try:
+                rec = pycolmap.Reconstruction(str(c))
+                img_count = len(rec.images)
+            except Exception:
+                pass
+        elif bin_img.is_file():
+            img_count = int(bin_img.stat().st_size // 1000)
 
-        # Orient normal along camera up direction
-        if nrm @ mean_cam_up < 0:
-            nrm = -nrm
-            d = -d
+        ranked.append((img_count, c))
 
-        angle_deg = float(np.degrees(np.arccos(np.clip(nrm @ mean_cam_up, -1.0, 1.0))))
-
-        # Check if plane is horizontal
-        if angle_deg <= max_angle_deg:
-            cam_dists = [float(nrm @ c + d) for c in cam_centres]
-            frac_above = float(np.mean([cd > 0 for cd in cam_dists]))
-            # Verify cameras are above the plane
-            if frac_above >= 0.80:
-                inlier_pts = np.asarray(curr_pcd.select_by_index(inliers).points)
-                mean_h = float(np.mean(inlier_pts @ mean_cam_up))
-                # Count total inliers across full point cloud
-                all_inliers = int(np.sum(np.abs(pts_xyz @ nrm + d) < dist_thresh))
-                candidates.append({
-                    "iteration": i,
-                    "normal": nrm,
-                    "d": d,
-                    "angle_deg": angle_deg,
-                    "height": mean_h,
-                    "cam_dist": float(np.mean(cam_dists)),
-                    "inliers": all_inliers,
-                })
-
-        curr_pcd = curr_pcd.select_by_index(inliers, invert=True)
-
-    # 2. Targeted search in lowest 30% of heights to avoid missing floor
-    h_pts = pts_xyz @ mean_cam_up
-    p30 = np.percentile(h_pts, 30)
-    floor_slice = pts_xyz[h_pts < p30]
-    if len(floor_slice) >= 150:
-        pcd_slice = o3d.geometry.PointCloud()
-        pcd_slice.points = o3d.utility.Vector3dVector(floor_slice)
-        curr_slice = pcd_slice
-        for j in range(5):
-            if len(curr_slice.points) < 100:
-                break
-            plane_model, inliers = curr_slice.segment_plane(
-                distance_threshold=dist_thresh,
-                ransac_n=3,
-                num_iterations=2000,
-            )
-            nrm = np.array(plane_model[:3])
-            d = float(plane_model[3])
-            n_len = np.linalg.norm(nrm)
-            if n_len > 1e-7:
-                nrm /= n_len
-                d /= n_len
-                if nrm @ mean_cam_up < 0:
-                    nrm = -nrm
-                    d = -d
-                angle_deg = float(np.degrees(np.arccos(np.clip(nrm @ mean_cam_up, -1.0, 1.0))))
-                if angle_deg <= max_angle_deg:
-                    cam_dists = [float(nrm @ c + d) for c in cam_centres]
-                    if float(np.mean([cd > 0 for cd in cam_dists])) >= 0.80:
-                        inlier_pts = np.asarray(curr_slice.select_by_index(inliers).points)
-                        mean_h = float(np.mean(inlier_pts @ mean_cam_up))
-                        all_inliers = int(np.sum(np.abs(pts_xyz @ nrm + d) < dist_thresh))
-                        candidates.append({
-                            "iteration": f"slice_{j}",
-                            "normal": nrm,
-                            "d": d,
-                            "angle_deg": angle_deg,
-                            "height": mean_h,
-                            "cam_dist": float(np.mean(cam_dists)),
-                            "inliers": all_inliers,
-                        })
-            curr_slice = curr_slice.select_by_index(inliers, invert=True)
-
-    # 3. Robust Floor Plane Selection & Joint PCA Refinement:
-    # Indoor rooms feature multiple horizontal planes: tabletops, chair seats, and the floor.
-    # The floor is the lowest physical plane situated below furniture (cam_dist >= 3.5 units).
-    valid = [c for c in candidates if c["inliers"] >= min_inliers]
-    if not valid:
-        if candidates:
-            candidates.sort(key=lambda c: -c["inliers"])
-            valid = [candidates[0]]
-        else:
-            return None
-
-    # Compute camera trajectory plane normal (user walked a level loop)
-    mu_cams = np.mean(cam_centres, axis=0)
-    _, _, Vt_cams = np.linalg.svd(cam_centres - mu_cams)
-    n_cams = Vt_cams[-1]
-    if n_cams @ mean_cam_up < 0:
-        n_cams = -n_cams
-    n_cams /= np.linalg.norm(n_cams)
-
-    # Deep floor candidates (situated below tables and chairs, cam_dist >= 3.5)
-    deep_candidates = [c for c in valid if c["cam_dist"] >= 3.5]
-    if deep_candidates:
-        deep_candidates.sort(key=lambda c: -c["inliers"])
-        best_cand = deep_candidates[0]
-    else:
-        valid.sort(key=lambda c: c["height"])
-        best_cand = valid[0]
-
-    # PCA refinement of floor inliers + joint gravity alignment with camera trajectory
-    n_init = best_cand["normal"]
-    d_init = best_cand["d"]
-    inlier_mask = np.abs(pts_xyz @ n_init + d_init) < dist_thresh
-    floor_pts = pts_xyz[inlier_mask]
-
-    if len(floor_pts) >= 50:
-        mu_floor = np.mean(floor_pts, axis=0)
-        _, _, Vt_f = np.linalg.svd(floor_pts - mu_floor)
-        n_floor = Vt_f[-1]
-        if n_floor @ mean_cam_up < 0:
-            n_floor = -n_floor
-        n_floor /= np.linalg.norm(n_floor)
-
-        # Joint normal balancing dense floor surface and level camera walk
-        n_joint = n_floor + n_cams
-        n_joint /= np.linalg.norm(n_joint)
-        d_joint = -float(np.dot(n_joint, mu_floor))
-        angle_joint = float(np.degrees(np.arccos(np.clip(n_joint @ mean_cam_up, -1.0, 1.0))))
-        cam_dists_joint = [float(n_joint @ c + d_joint) for c in cam_centres]
-
-        return {
-            "iteration": f"{best_cand['iteration']}_joint_pca",
-            "normal": n_joint,
-            "d": d_joint,
-            "angle_deg": angle_joint,
-            "height": float(np.mean(floor_pts @ mean_cam_up)),
-            "cam_dist": float(np.mean(cam_dists_joint)),
-            "inliers": int(np.sum(np.abs(pts_xyz @ n_joint + d_joint) < dist_thresh)),
-        }
-
-    return best_cand
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    best_count, best_path = ranked[0]
+    return best_path
 
 
 # ---------------------------------------------------------------------------
@@ -479,12 +400,9 @@ def export_nerfstudio_transforms(
     to Nerfstudio and 3D Gaussian Splatting loaders.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
     if not cameras or not images:
-        print(f"[WARN] No cameras or images to export to {output_path}")
         return
 
-    # Use primary camera for intrinsics
     cam_id = list(cameras.keys())[0]
     cam = cameras[cam_id]
     model = cam["model"]
@@ -496,42 +414,29 @@ def export_nerfstudio_transforms(
     fl_y = params[0]
     cx = float(w) / 2.0
     cy = float(h) / 2.0
-    k1 = 0.0
-    k2 = 0.0
-    p1 = 0.0
-    p2 = 0.0
+    k1, k2, p1, p2 = 0.0, 0.0, 0.0, 0.0
 
     if model in ("SIMPLE_RADIAL", "RADIAL"):
-        fl_x = params[0]
-        fl_y = params[0]
-        cx = params[1]
-        cy = params[2]
+        fl_x, fl_y = params[0], params[0]
+        cx, cy = params[1], params[2]
         k1 = params[3]
-    elif model in ("PINHOLE",):
-        fl_x = params[0]
-        fl_y = params[1]
-        cx = params[2]
-        cy = params[3]
+    elif model == "PINHOLE":
+        fl_x, fl_y = params[0], params[1]
+        cx, cy = params[2], params[3]
     elif model in ("OPENCV", "OPENCV_FISHEYE"):
-        fl_x = params[0]
-        fl_y = params[1]
-        cx = params[2]
-        cy = params[3]
-        k1 = params[4]
-        k2 = params[5]
-        p1 = params[6]
-        p2 = params[7]
+        fl_x, fl_y = params[0], params[1]
+        cx, cy = params[2], params[3]
+        k1, k2, p1, p2 = params[4], params[5], params[6], params[7]
 
     frames_list = []
-    # Sort frames in natural temporal order
     sorted_img_ids = sorted(images.keys(), key=lambda i: frame_number(images[i]["name"]))
 
     for img_id in sorted_img_ids:
         img = images[img_id]
-        R_w2c = quat_to_rot(img["qw"], img["qx"], img["qy"], img["qz"])
+        R_w2c = quat_to_rotmat(img["qw"], img["qx"], img["qy"], img["qz"])
         t_w2c = np.array([img["tx"], img["ty"], img["tz"]])
         C = -R_w2c.T @ t_w2c
-        R_c2w = R_w2c.T  # [r_x, r_y, r_z]
+        R_c2w = R_w2c.T
 
         # Convert OpenCV camera axes to OpenGL camera axes:
         # Flip column 1 (Y: down -> up) and column 2 (Z: forward -> back)
@@ -539,9 +444,8 @@ def export_nerfstudio_transforms(
         c2w_opengl[:3, 0] = R_c2w[:, 0]   # +X Right
         c2w_opengl[:3, 1] = -R_c2w[:, 1]  # +Y Up
         c2w_opengl[:3, 2] = -R_c2w[:, 2]  # +Z Backwards
-        c2w_opengl[:3, 3] = C             # Camera origin in aligned world coords
+        c2w_opengl[:3, 3] = C
 
-        # File path relative to scene root
         fname = img["name"]
         rel_path = f"{image_rel_prefix}/{fname}" if not fname.startswith(image_rel_prefix) else fname
 
@@ -575,476 +479,647 @@ def export_nerfstudio_transforms(
 
 
 # ---------------------------------------------------------------------------
-# Main Pipeline
+# Main Alignment Pipeline
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    ap = argparse.ArgumentParser(
-        description="Stage 3: Metric, Gravity-Aligned, Y-up Floor Alignment."
-    )
-    ap.add_argument("--scene", required=True, help="Scene name (subfolder of data/)")
-    ap.add_argument("--config", default="configs/default.yaml", help="Configuration YAML path")
-    ap.add_argument("--sparse-dir", default=None, help="Input COLMAP sparse model directory")
-    ap.add_argument("--output-dir", default=None, help="Output aligned COLMAP directory")
-    ap.add_argument("--measurements", default=None, help="Path to measurements JSON file")
-    ap.add_argument(
-        "--scale-mode",
-        choices=["phone_height", "points"],
-        default="phone_height",
-        help="Scale mode: 'phone_height' (assume camera height) or 'points' (known distance)",
-    )
-    ap.add_argument(
-        "--phone-height",
-        type=float,
-        default=None,
-        help="Target mean camera height above floor in metres (default: 1.45 m)",
-    )
-    ap.add_argument(
-        "--point-ids",
-        nargs=2,
-        type=int,
-        default=None,
-        help="Two point IDs in points3D.txt for metric distance scaling",
-    )
-    ap.add_argument(
-        "--point-coords",
-        nargs=6,
-        type=float,
-        default=None,
-        help="Coordinates x1 y1 z1 x2 y2 z2 for metric distance scaling",
-    )
-    ap.add_argument(
-        "--distance",
-        type=float,
-        default=None,
-        help="Known metric distance in metres between points for scale mode (b)",
-    )
-    ap.add_argument(
-        "--dist-thresh",
-        type=float,
-        default=0.08,
-        help="RANSAC distance threshold for plane fitting",
-    )
-    ap.add_argument(
-        "--max-floor-angle",
-        type=float,
-        default=8.0,
-        help="Maximum angle (degrees) between floor normal and camera-up vector",
-    )
-    ap.add_argument(
-        "--min-inliers",
-        type=int,
-        default=150,
-        help="Minimum inliers required for valid floor plane",
-    )
-    ap.add_argument(
-        "--max-planes",
-        type=int,
-        default=25,
-        help="Maximum plane candidates to evaluate in iterative RANSAC",
-    )
-    args = ap.parse_args()
+def align_scene(
+    scene: str,
+    config_path: str = "configs/default.yaml",
+    input_model: Optional[str] = None,
+    output_dir: Optional[str] = None,
+    floor_height_manual: Optional[float] = None,
+    scale_mode: Optional[str] = None,
+    point_ids: Optional[List[int]] = None,
+    point_coords: Optional[List[float]] = None,
+    known_distance: Optional[float] = None,
+    data_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Execute complete Phase 4 Scene Alignment pipeline."""
+    repo_root = Path.cwd()
+    cfg = load_config(config_path)
 
-    cfg = load_config(args.config)
-    scene = args.scene
-    data_dir = Path("data") / scene
-
-    # 1. Resolve sparse input directory
-    if args.sparse_dir:
-        sparse_dir = Path(args.sparse_dir)
-    else:
-        candidates = [
-            data_dir / "colmap" / "sparse" / "0",
-            data_dir / "sparse" / "0",
-            data_dir / "colmap" / "sparse",
-        ]
-        sparse_dir = next((c for c in candidates if (c / "cameras.txt").is_file() or (c / "cameras.bin").is_file()), candidates[0])
-
-    if not sparse_dir.is_dir():
-        print(f"[FAIL] Sparse reconstruction directory not found: {sparse_dir}", file=sys.stderr)
-        print("  Actionable advice: Run Stage 2 SfM (pipeline/run_sfm.py) first to generate sparse/0.", file=sys.stderr)
-        sys.exit(1)
-
-    # 2. Resolve output directories
-    # Primary output: data/<scene>/colmap_aligned/
-    output_dir = Path(args.output_dir) if args.output_dir else (data_dir / "colmap_aligned")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    # Secondary backward-compatible directory: data/<scene>/colmap/aligned/
-    legacy_aligned_dir = data_dir / "colmap" / "aligned"
-    legacy_aligned_dir.mkdir(parents=True, exist_ok=True)
-
-    # 3. Resolve target phone height from CLI or config
-    target_phone_height = args.phone_height
-    if target_phone_height is None:
-        target_phone_height = float(cfg.get("alignment", {}).get("phone_height_m", 1.45))
-
-    # 4. Resolve measurements
-    meas_path = Path(args.measurements) if args.measurements else (data_dir / "measurements.json")
-    meas_data = {}
-    if meas_path.is_file():
-        try:
-            with open(meas_path, "r", encoding="utf-8") as f:
-                meas_data = json.load(f)
-        except Exception:
-            pass
-
-    print("=" * 64)
-    print("  NAMMA SPACE -- STAGE 3: METRIC Y-UP SCENE ALIGNMENT")
-    print("=" * 64)
-    print(f"  Scene             : {scene}")
-    print(f"  Input Sparse Dir  : {sparse_dir}")
-    print(f"  Output Aligned Dir: {output_dir}")
-    print(f"  Scale Mode        : {args.scale_mode}")
-    if args.scale_mode == "phone_height":
-        print(f"  Target Phone H    : {target_phone_height:.2f} m")
-    print("-" * 64)
+    # Config sections
+    align_cfg = cfg.get("align", cfg.get("alignment", {}))
+    data_dir_path = Path(data_dir) if data_dir else (repo_root / "data" / scene)
+    data_dir = data_dir_path
 
     # -----------------------------------------------------------------------
-    # Step 1: Load Reconstruction
+    # STEP 0: PICK THE INPUT
     # -----------------------------------------------------------------------
-    print("\n[Step 1/5] Loading sparse reconstruction...")
-    txt_cameras = sparse_dir / "cameras.txt"
-    txt_images = sparse_dir / "images.txt"
-    txt_points = sparse_dir / "points3D.txt"
+    model_key = input_model or align_cfg.get("input_model")
+    model_path = pick_best_colmap_model(repo_root, scene, model_key)
+    print(f"\n[STEP 0] Selected input model: {model_path}")
 
+    # -----------------------------------------------------------------------
+    # STEP 1: LOAD
+    # -----------------------------------------------------------------------
+    print("\n[STEP 1] Loading COLMAP model...")
+    txt_cameras = model_path / "cameras.txt"
+    txt_images = model_path / "images.txt"
+    txt_points = model_path / "points3D.txt"
+
+    # Convert binary to TXT if TXT is missing
     if not (txt_cameras.is_file() and txt_images.is_file() and txt_points.is_file()):
-        print(f"[FAIL] Missing COLMAP text model files in {sparse_dir}", file=sys.stderr)
-        print("  Actionable advice: Run COLMAP model_converter to export sparse/0 to TXT.", file=sys.stderr)
-        sys.exit(1)
+        colmap_bin = shutil.which("colmap")
+        if colmap_bin:
+            cmd = [
+                colmap_bin, "model_converter",
+                "--input_path", str(model_path),
+                "--output_path", str(model_path),
+                "--output_type", "TXT"
+            ]
+            subprocess.run(cmd, capture_output=True, check=True)
 
     cameras = parse_cameras_txt(txt_cameras)
     images = parse_images_txt(txt_images)
     points = parse_points3d_txt(txt_points)
-    print(f"  Loaded: {len(cameras)} cameras, {len(images)} images, {len(points)} 3D points")
 
-    if len(images) == 0 or len(points) == 0:
-        print("[FAIL] Sparse reconstruction is empty (0 images or 0 points).", file=sys.stderr)
-        sys.exit(1)
+    num_images = len(images)
+    num_points = len(points)
+    if num_images == 0 or num_points == 0:
+        raise RuntimeError(f"Model at {model_path} has 0 images or points.")
 
-    # Filter degenerate poses (|C| >= 1000)
-    DEGENERATE_NORM = 1000.0
-    inlier_iids = [
-        iid for iid, img in images.items()
-        if np.linalg.norm(camera_centre(img)) < DEGENERATE_NORM
-    ]
-    print(f"  Inlier camera poses: {len(inlier_iids)} / {len(images)}")
+    # Calculate mean reprojection error
+    reproj_errors = [p["error"] for p in points.values()]
+    mean_reproj_error = float(np.mean(reproj_errors)) if reproj_errors else 0.0
+
+    # Intrinsics
+    primary_cam = list(cameras.values())[0]
+    cam_model = primary_cam["model"]
+    params = primary_cam["params"]
+    fx, fy, k1 = 0.0, 0.0, 0.0
+
+    if cam_model in ("SIMPLE_RADIAL", "RADIAL"):
+        fx = params[0]
+        fy = params[0]
+        k1 = params[3]
+    elif cam_model == "PINHOLE":
+        fx = params[0]
+        fy = params[1]
+        k1 = 0.0
+    elif cam_model in ("OPENCV", "OPENCV_FISHEYE"):
+        fx = params[0]
+        fy = params[1]
+        k1 = params[4]
+
+    print(f"  Images count          : {num_images}")
+    print(f"  3D points count       : {num_points}")
+    print(f"  Mean reproj error     : {mean_reproj_error:.4f} px")
+    print(f"  Intrinsics            : fx={fx:.2f}, fy={fy:.2f}, k1={k1:.4f} (Model: {cam_model})")
+
+    # If fx and fy differ by > 5%, print WARNING
+    f_denom = max(fx, fy) if max(fx, fy) > 1e-4 else 1.0
+    f_diff_pct = abs(fx - fy) / f_denom * 100.0
+    if f_diff_pct > 5.0:
+        print(f"  [WARNING] fx ({fx:.1f}) and fy ({fy:.1f}) differ by {f_diff_pct:.2f}% (> 5% threshold)!")
 
     # -----------------------------------------------------------------------
-    # Step 2: Mean Camera Up Vector & Floor Plane Detection
+    # STEP 2: UP VECTOR
     # -----------------------------------------------------------------------
-    print("\n[Step 2/5] Detecting floor plane (Iterative Open3D RANSAC)...")
+    print("\n[STEP 2] Estimating camera-up vector and spread...")
+    # Per camera, world_up_i = -R_cw[:, 1]. R_cw = R_wc.T
     cam_ups = []
     cam_centres = []
-    for iid in inlier_iids:
-        img = images[iid]
-        R = quat_to_rot(img["qw"], img["qx"], img["qy"], img["qz"])
-        # In COLMAP camera frame, -Y is Up
-        cam_ups.append(R.T @ np.array([0., -1., 0.]))
-        cam_centres.append(camera_centre(img))
+    image_list = sorted(images.values(), key=lambda im: frame_number(im["name"]))
 
-    cam_ups = np.array(cam_ups)
+    for im in image_list:
+        R_wc = quat_to_rotmat(im["qw"], im["qx"], im["qy"], im["qz"])
+        R_cw = R_wc.T
+        world_up_i = -R_cw[:, 1]
+        world_up_i /= np.linalg.norm(world_up_i)
+        cam_ups.append(world_up_i)
+        cam_centres.append(camera_centre(im))
+
+    U = np.array(cam_ups)
     cam_centres = np.array(cam_centres)
 
-    # Mean camera up vector via SVD
-    _, _, Vt = np.linalg.svd(cam_ups)
-    mean_up = Vt[0]
-    if np.mean(cam_ups @ mean_up) < 0:
-        mean_up = -mean_up
-    mean_up /= np.linalg.norm(mean_up)
-    print(f"  Mean camera-up vector: [{mean_up[0]:+.4f} {mean_up[1]:+.4f} {mean_up[2]:+.4f}]")
+    # First principal direction via SVD of stacked up vectors
+    mu_up = np.mean(U, axis=0)
+    _, _, Vt = np.linalg.svd(U)
+    up_vector = Vt[0]
+    if np.dot(up_vector, mu_up) < 0:
+        up_vector = -up_vector
+    up_vector /= np.linalg.norm(up_vector)
 
+    # Spread: mean angle between each camera's up and the result
+    angles = np.degrees(np.arccos(np.clip(U @ up_vector, -1.0, 1.0)))
+    up_spread_deg = float(np.mean(angles))
+
+    print(f"  Result UP vector      : [{up_vector[0]:+.4f}, {up_vector[1]:+.4f}, {up_vector[2]:+.4f}]")
+    print(f"  Camera up spread      : {up_spread_deg:.2f}°")
+
+    if up_spread_deg > 25.0:
+        print(f"  [WARNING] Camera up spread ({up_spread_deg:.1f}°) exceeds 25° (probable rotation-only motion).")
+
+    # -----------------------------------------------------------------------
+    # STEP 3: FLOOR
+    # -----------------------------------------------------------------------
+    print("\n[STEP 3] Fitting floor planes via Open3D RANSAC...")
     pts_xyz = np.array([p["xyz"] for p in points.values()])
+    h_all = pts_xyz @ up_vector
 
-    floor_result = detect_floor_plane_iterative(
-        pts_xyz=pts_xyz,
-        cam_centres=cam_centres,
-        mean_cam_up=mean_up,
-        dist_thresh=args.dist_thresh,
-        max_angle_deg=args.max_floor_angle,
-        min_inliers=args.min_inliers,
-        max_iterations=args.max_planes,
-    )
+    # Project points on UP and keep lowest 25% of height range
+    h_p005 = float(np.percentile(h_all, 0.5))
+    h_p995 = float(np.percentile(h_all, 99.5))
+    h_range = h_p995 - h_p005
+    cutoff_25 = h_p005 + 0.25 * h_range
+    # Ensure at least lowest 25% of points are retained
+    cutoff = max(cutoff_25, float(np.percentile(h_all, 25.0)))
 
-    if floor_result is None or floor_result["inliers"] < args.min_inliers:
-        found_inliers = floor_result["inliers"] if floor_result else 0
-        print(
-            f"[FAIL] Floor detection failed: insufficient floor inliers ({found_inliers} < {args.min_inliers}) "
-            f"or no horizontal plane found within {args.max_floor_angle}° of camera up.",
-            file=sys.stderr,
-        )
-        print("  Actionable advice: Verify scene capture has floor coverage, or increase --max-floor-angle / decrease --min-inliers.", file=sys.stderr)
+    pts_lowest = pts_xyz[h_all <= cutoff]
+    print(f"  Points in lowest 25% height range (h <= {cutoff:.3f}): {len(pts_lowest)} / {len(pts_xyz)}")
+
+    max_angle_deg = float(align_cfg.get("max_floor_angle_deg", 8.0))
+    min_inlier_ratio = float(align_cfg.get("min_inlier_ratio", 0.015))
+    min_inliers_req = int(math.ceil(min_inlier_ratio * num_points))
+    dist_thresh = float(align_cfg.get("dist_thresh", 0.05))
+    max_planes = int(align_cfg.get("max_planes", 6))
+
+    plane_candidates = []
+    chosen_plane = None
+
+    manual_h = floor_height_manual if floor_height_manual is not None else align_cfg.get("floor_height_manual")
+
+    if manual_h is not None:
+        print(f"  [INFO] Manual floor height override specified: {manual_h:.4f}")
+        chosen_plane = {
+            "plane_idx": "manual",
+            "normal": up_vector,
+            "d": -float(manual_h),
+            "height": float(manual_h),
+            "inliers": int(np.sum(np.abs(pts_xyz @ up_vector - float(manual_h)) < dist_thresh)),
+            "angle_to_up": 0.0,
+            "chosen": True,
+        }
+        plane_candidates.append(chosen_plane)
+    else:
+        if o3d is None:
+            raise RuntimeError("Open3D is required for RANSAC plane fitting.")
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts_lowest)
+        curr_pcd = pcd
+
+        for p_idx in range(1, max_planes + 1):
+            if len(curr_pcd.points) < 50:
+                break
+            plane_model, inlier_indices = curr_pcd.segment_plane(
+                distance_threshold=dist_thresh,
+                ransac_n=3,
+                num_iterations=2000,
+            )
+            nrm = np.array(plane_model[:3])
+            d_val = float(plane_model[3])
+            n_len = np.linalg.norm(nrm)
+            if n_len < 1e-7:
+                curr_pcd = curr_pcd.select_by_index(inlier_indices, invert=True)
+                continue
+            nrm /= n_len
+            d_val /= n_len
+
+            # Orient normal so nrm @ up_vector > 0
+            if np.dot(nrm, up_vector) < 0:
+                nrm = -nrm
+                d_val = -d_val
+
+            angle_to_up = float(np.degrees(np.arccos(np.clip(np.dot(nrm, up_vector), -1.0, 1.0))))
+
+            # Inliers across all points in model
+            all_inliers = int(np.sum(np.abs(pts_xyz @ nrm + d_val) < dist_thresh))
+
+            # Height along UP vector
+            inlier_pts = np.asarray(curr_pcd.select_by_index(inlier_indices).points)
+            mean_h = float(np.mean(inlier_pts @ up_vector)) if len(inlier_pts) > 0 else -d_val
+
+            plane_candidates.append({
+                "plane_idx": p_idx,
+                "normal": nrm,
+                "d": d_val,
+                "height": mean_h,
+                "inliers": all_inliers,
+                "angle_to_up": angle_to_up,
+                "chosen": False,
+            })
+            curr_pcd = curr_pcd.select_by_index(inlier_indices, invert=True)
+
+        # Filter qualifying planes: angle <= max_angle_deg and inliers >= 1.5% of all points
+        qualifying = [
+            c for c in plane_candidates
+            if c["angle_to_up"] <= max_angle_deg and c["inliers"] >= min_inliers_req
+        ]
+
+        if qualifying:
+            # Choose the LOWEST plane to avoid tabletops, stage tops, seats
+            qualifying.sort(key=lambda c: c["height"])
+            chosen_plane = qualifying[0]
+            for c in plane_candidates:
+                if c["plane_idx"] == chosen_plane["plane_idx"]:
+                    c["chosen"] = True
+                    break
+
+    # Print candidate table
+    print("\n  Plane Candidate Table:")
+    print("  " + "-" * 72)
+    print(f"  {'Plane':<6} {'Height (u)':<12} {'Inliers':<12} {'Inlier %':<10} {'Angle to UP':<14} {'Chosen?'}")
+    print("  " + "-" * 72)
+    for c in plane_candidates:
+        inlier_pct = (c["inliers"] / num_points) * 100.0
+        chosen_str = "[YES] CHOSEN" if c["chosen"] else "No"
+        print(f"  #{c['plane_idx']:<5} {c['height']:<12.4f} {c['inliers']:<12} {inlier_pct:<9.2f}% {c['angle_to_up']:<13.2f}° {chosen_str}")
+    print("  " + "-" * 72)
+
+    if chosen_plane is None:
+        print("\n[FAIL] Floor detection failed: No candidate plane qualified!", file=sys.stderr)
+        print("  Actionable advice: Check lighting and the textureless floor in your capture.", file=sys.stderr)
+        print("  You can manually override the floor plane using --floor-height <value>.", file=sys.stderr)
         sys.exit(1)
 
-    floor_normal = floor_result["normal"]
-    angle_to_up = floor_result["angle_deg"]
-    print(f"  Floor normal candidate: [{floor_normal[0]:+.4f} {floor_normal[1]:+.4f} {floor_normal[2]:+.4f}]")
-    print(f"  Angle to camera-up    : {angle_to_up:.2f}° (threshold: <= {args.max_floor_angle:.1f}°)")
-    print(f"  Floor inlier count    : {floor_result['inliers']} points")
-    print(f"  Mean camera clearance : {floor_result['cam_dist']:.3f} units above floor")
+    print(f"\n  Selected Floor Plane: Height = {chosen_plane['height']:.4f} u, Inliers = {chosen_plane['inliers']} ({chosen_plane['inliers']/num_points*100:.2f}%), Angle to UP = {chosen_plane['angle_to_up']:.2f}°")
 
     # -----------------------------------------------------------------------
-    # Step 3: Rigid Rotation (+Y Up, Wall Alignment) & Floor Snap (y = 0)
+    # STEP 4: ROTATE AND TRANSLATE
     # -----------------------------------------------------------------------
-    print("\n[Step 3/5] Rotating floor normal to +Y and snapping floor to y = 0.0...")
+    print("\n[STEP 4] Applying rotation and translation...")
+    floor_n = chosen_plane["normal"]
+    # 1. Rotate UP/normal to +Y = [0, 1, 0]
+    R_floor = rodrigues_align(floor_n, np.array([0.0, 1.0, 0.0]))
+    assert abs(np.linalg.det(R_floor) - 1.0) < 1e-4
 
-    # R_floor rotates floor normal to [0, 1, 0]
-    R_floor = rotation_align(floor_normal, np.array([0., 1., 0.]))
+    # 2. Wall alignment: PCA of in-plane points between 0.3m and 1.8m above floor
+    pts_rot1 = pts_xyz @ R_floor.T
+    cam_centres_rot1 = cam_centres @ R_floor.T
 
-    # Yaw rotation around Y: align dominant walls with coordinate axes
-    pts_temp = pts_xyz @ R_floor.T
-    xz = pts_temp[:, [0, 2]]
-    p05 = np.percentile(xz, 5, axis=0)
-    p95 = np.percentile(xz, 95, axis=0)
-    xz_filt = xz[(xz[:, 0] >= p05[0]) & (xz[:, 0] <= p95[0]) & (xz[:, 1] >= p05[1]) & (xz[:, 1] <= p95[1])]
+    # Preliminary scale estimate from camera height to compute 0.3m and 1.8m bounds
+    mean_cam_y1 = float(np.mean(cam_centres_rot1[:, 1]))
+    floor_y1 = chosen_plane["height"]  # unscaled height
+    rough_h = abs(mean_cam_y1 - floor_y1) if abs(mean_cam_y1 - floor_y1) > 0.1 else 1.45
+    rough_scale = 1.45 / rough_h  # meters per unscaled unit
 
-    cov = np.cov(xz_filt.T)
-    eigenvals, eigenvecs = np.linalg.eigh(cov)
-    v_wall = eigenvecs[:, 1]
-    wall_phi = math.atan2(v_wall[1], v_wall[0])
+    # Points between 0.3m and 1.8m above floor
+    y_min_u = floor_y1 + 0.30 / rough_scale
+    y_max_u = floor_y1 + 1.80 / rough_scale
+    wall_mask = (pts_rot1[:, 1] >= y_min_u) & (pts_rot1[:, 1] <= y_max_u)
+    wall_pts = pts_rot1[wall_mask]
+    if len(wall_pts) < 100:
+        wall_pts = pts_rot1  # fallback to all points if sparse
 
-    # Direct Leg 1 towards North (-Z)
-    sorted_iids = sorted(inlier_iids, key=lambda i: frame_number(images[i]["name"]))
-    c_start = camera_centre(images[sorted_iids[0]]) @ R_floor.T
-    c_leg1_end = camera_centre(images[sorted_iids[min(20, len(sorted_iids)-1)]]) @ R_floor.T
-    v_leg1 = c_leg1_end - c_start
+    # PCA in X-Z horizontal plane
+    xz = wall_pts[:, [0, 2]]
+    mu_xz = np.mean(xz, axis=0)
+    cov_xz = np.cov((xz - mu_xz).T)
+    eigvals, eigvecs = np.linalg.eigh(cov_xz)
+    v_wall = eigvecs[:, 1]  # principal wall direction
+    phi_wall = math.atan2(v_wall[1], v_wall[0])
 
-    best_angle_deg = 0.0
+    # First leg of camera path
+    # sorted by frame number
+    c_start = cam_centres_rot1[0]
+    # First leg end is after ~15-25 frames or 10% of path
+    leg1_idx = min(25, len(cam_centres_rot1) - 1)
+    c_leg1 = cam_centres_rot1[leg1_idx]
+    v_leg1 = c_leg1 - c_start  # [dx, dy, dz]
+
+    # Test 4 90-degree yaw options to make dominant walls axis-aligned
+    # AND make FIRST leg point UP the image in top.png (image vertical is Z inverted -> points along -Z)
+    best_yaw_deg = 0.0
     best_score = -1e9
+
     for k in range(4):
-        deg = math.degrees(-wall_phi) + k * 90.0
-        rad = math.radians(deg)
-        R2 = np.array([[math.cos(rad), -math.sin(rad)], [math.sin(rad), math.cos(rad)]])
+        yaw_deg = math.degrees(-phi_wall) + k * 90.0
+        rad = math.radians(yaw_deg)
+        cos_y, sin_y = math.cos(rad), math.sin(rad)
+        # R2 rotates (X, Z)
+        R2 = np.array([[cos_y, -sin_y], [sin_y, cos_y]])
         leg1_rot = R2 @ np.array([v_leg1[0], v_leg1[2]])
+        # Pointing UP the image in inverted-Z plot means heading towards -Z: score = -Z_rot
         score = -leg1_rot[1]
         if score > best_score:
             best_score = score
-            best_angle_deg = deg
+            best_yaw_deg = yaw_deg
 
-    rad_yaw = math.radians(best_angle_deg)
-    cos_y, sin_y = math.cos(rad_yaw), math.sin(rad_yaw)
+    rad_best = math.radians(best_yaw_deg)
+    cos_b, sin_b = math.cos(rad_best), math.sin(rad_best)
     R_yaw = np.array([
-        [ cos_y, 0.0, -sin_y],
+        [ cos_b, 0.0, -sin_b],
         [   0.0, 1.0,    0.0],
-        [ sin_y, 0.0,  cos_y],
+        [ sin_b, 0.0,  cos_b],
     ])
+    assert abs(np.linalg.det(R_yaw) - 1.0) < 1e-4
 
-    # Total rotation matrix: R_total = R_yaw @ R_floor (det = +1)
+    # Combined proper rotation matrix (det = +1.0)
     R_total = R_yaw @ R_floor
-    print(f"  Canonical wall yaw rotation: {best_angle_deg:.2f}° (Leg 1 points North -Z)")
+    assert abs(np.linalg.det(R_total) - 1.0) < 1e-4
 
     # Rotate 3D points
     for pt in points.values():
         pt["xyz"] = R_total @ pt["xyz"]
 
-    # Rotate camera poses: R_new = R_old @ R_total.T
-    R_total_T = R_total.T
-    for img in images.values():
-        R_cur = quat_to_rot(img["qw"], img["qx"], img["qy"], img["qz"]) @ R_total_T
-        qw, qx, qy, qz = rot_to_quat(R_cur)
-        img["qw"], img["qx"], img["qy"], img["qz"] = qw, qx, qy, qz
-
-    # Floor snap: calculate median Y of floor inliers in rotated frame
-    all_dists = np.abs(pts_xyz @ floor_normal + floor_result["d"])
-    floor_inliers_orig = pts_xyz[all_dists < args.dist_thresh]
-    floor_inliers_rot = floor_inliers_orig @ R_total.T
-    floor_y_unscaled = float(np.median(floor_inliers_rot[:, 1]))
-    print(f"  Unscaled floor plane Y level: {floor_y_unscaled:.4f} units")
+    # Rotate cameras: R_wc_new = R_wc_old @ R_total.T
+    for im in images.values():
+        R_cur = quat_to_rotmat(im["qw"], im["qx"], im["qy"], im["qz"]) @ R_total.T
+        qw, qx, qy, qz = rotmat_to_quat(R_cur)
+        im["qw"], im["qx"], im["qy"], im["qz"] = qw, qx, qy, qz
 
     # Translate so floor plane is at y = 0.0
-    t_snap = np.array([0., -floor_y_unscaled, 0.])
+    # Measure floor Y in rotated frame
+    inlier_mask = np.abs(pts_xyz @ floor_n + chosen_plane["d"]) < dist_thresh
+    floor_pts_rot = pts_xyz[inlier_mask] @ R_total.T
+    floor_y_unscaled = float(np.median(floor_pts_rot[:, 1])) if len(floor_pts_rot) > 0 else chosen_plane["height"]
+
+    t_snap = np.array([0.0, -floor_y_unscaled, 0.0])
     for pt in points.values():
         pt["xyz"] += t_snap
 
-    for img in images.values():
-        R_cur = quat_to_rot(img["qw"], img["qx"], img["qy"], img["qz"])
-        t_old = np.array([img["tx"], img["ty"], img["tz"]])
-        t_new = t_old - R_cur @ t_snap
-        img["tx"], img["ty"], img["tz"] = float(t_new[0]), float(t_new[1]), float(t_new[2])
+    # Camera translation update: t_wc_new = t_wc_old - R_wc_new @ t_snap
+    for im in images.values():
+        R_wc_cur = quat_to_rotmat(im["qw"], im["qx"], im["qy"], im["qz"])
+        t_old = np.array([im["tx"], im["ty"], im["tz"]])
+        t_new = t_old - R_wc_cur @ t_snap
+        im["tx"], im["ty"], im["tz"] = float(t_new[0]), float(t_new[1]), float(t_new[2])
+
+    print(f"  Wall Yaw Rotation     : {best_yaw_deg:.2f}° (First leg points North / up top-view)")
+    print(f"  Floor Snapped Level   : from y = {floor_y_unscaled:.4f} u to y = 0.0000 m")
 
     # -----------------------------------------------------------------------
-    # Step 4: Metric Scale Alignment
+    # STEP 5: SCALE
     # -----------------------------------------------------------------------
-    print("\n[Step 4/5] Metric scale alignment...")
-    unscaled_centres = [camera_centre(images[i]) for i in inlier_iids]
-    unscaled_cam_heights = [float(c[1]) for c in unscaled_centres]
-    mean_unscaled_h = float(np.mean(unscaled_cam_heights))
-
-    scale_method = args.scale_mode
-    scale_m_per_unit = 1.0
-
-    if args.scale_mode == "points":
-        if args.point_ids and args.distance:
-            p1_id, p2_id = args.point_ids
-            if p1_id in points and p2_id in points:
-                dist_unscaled = float(np.linalg.norm(points[p1_id]["xyz"] - points[p2_id]["xyz"]))
-                scale_m_per_unit = args.distance / dist_unscaled
-                print(f"  Mode (b) Point IDs [{p1_id}, {p2_id}]: unscaled dist = {dist_unscaled:.4f} u, target = {args.distance:.2f} m")
-                print(f"  --> Metric scale: {scale_m_per_unit:.5f} m/unit")
-            else:
-                print(f"[WARN] Point IDs [{p1_id}, {p2_id}] not found in points3D.txt; falling back to phone_height mode.")
-                scale_method = "phone_height"
-        elif args.point_coords and args.distance:
-            p1 = np.array(args.point_coords[:3])
-            p2 = np.array(args.point_coords[3:])
-            dist_unscaled = float(np.linalg.norm(p1 - p2))
-            scale_m_per_unit = args.distance / dist_unscaled
-            print(f"  Mode (b) Coordinates: unscaled dist = {dist_unscaled:.4f} u, target = {args.distance:.2f} m")
-            print(f"  --> Metric scale: {scale_m_per_unit:.5f} m/unit")
-        else:
-            print("[WARN] Incomplete points arguments for mode (b); falling back to phone_height mode.")
-            scale_method = "phone_height"
-
-    if scale_method == "phone_height":
-        scale_m_per_unit = target_phone_height / mean_unscaled_h if mean_unscaled_h > 0.01 else 0.35
-        print(f"  Mode (a) Phone Height: unscaled mean height = {mean_unscaled_h:.4f} u, target = {target_phone_height:.2f} m")
-        print(f"  --> Metric scale: {scale_m_per_unit:.5f} m/unit")
-
-    # Apply metric scale
-    for pt in points.values():
-        pt["xyz"] *= scale_m_per_unit
-
-    for img in images.values():
-        img["tx"] *= scale_m_per_unit
-        img["ty"] *= scale_m_per_unit
-        img["tz"] *= scale_m_per_unit
-
-    # -----------------------------------------------------------------------
-    # Sanity Checks & Statistics
-    # -----------------------------------------------------------------------
-    aligned_pts = np.array([p["xyz"] for p in points.values()])
-    aligned_cams = np.array([camera_centre(images[i]) for i in inlier_iids])
-    aligned_cam_heights = aligned_cams[:, 1]
-
-    mean_h_m = float(np.mean(aligned_cam_heights))
-    std_h_m = float(np.std(aligned_cam_heights))
-    med_h_m = float(np.median(aligned_cam_heights))
-    min_h_m = float(np.min(aligned_cam_heights))
-    max_h_m = float(np.max(aligned_cam_heights))
-
-    x_span_m = float(np.percentile(aligned_pts[:, 0], 98) - np.percentile(aligned_pts[:, 0], 2))
-    z_span_m = float(np.percentile(aligned_pts[:, 2], 98) - np.percentile(aligned_pts[:, 2], 2))
-    ceiling_h_m = float(np.percentile(aligned_pts[:, 1], 98))
-
-    print("\n" + "=" * 64)
-    print("  METRIC SCENE ALIGNMENT SANITY CHECK")
-    print("=" * 64)
-    print(f"  Camera Height Mean : {mean_h_m:.3f} m (std: ±{std_h_m:.3f} m)")
-    print(f"  Camera Height Range: [{min_h_m:.2f} m, {max_h_m:.2f} m] (median: {med_h_m:.2f} m)")
-    print(f"  Room Extents (X x Z): {x_span_m:.2f} m (width) x {z_span_m:.2f} m (length)")
-    print(f"  Estimated Ceiling  : {ceiling_h_m:.2f} m above floor")
-
-    # Compare against measurements.json if present
-    if meas_data:
-        room_meas = meas_data.get("room", meas_data)
-        m_len = room_meas.get("length_m", room_meas.get("length"))
-        m_wid = room_meas.get("width_m", room_meas.get("width"))
-        m_cei = room_meas.get("ceiling_height_m", room_meas.get("ceiling"))
-        print("\n  Comparison against measurements.json:")
-        if m_wid is not None:
-            print(f"    Width  (X): Reconstructed {x_span_m:.2f} m vs Measured {float(m_wid):.2f} m")
-        if m_len is not None:
-            print(f"    Length (Z): Reconstructed {z_span_m:.2f} m vs Measured {float(m_len):.2f} m")
-        if m_cei is not None:
-            print(f"    Ceiling   : Reconstructed {ceiling_h_m:.2f} m vs Measured {float(m_cei):.2f} m")
-    print("-" * 64)
-
-    # -----------------------------------------------------------------------
-    # Step 5: Save Outputs
-    # -----------------------------------------------------------------------
-    print("\n[Step 5/5] Writing outputs...")
-
-    # A. COLMAP text model -> data/<scene>/colmap_aligned/
-    write_cameras_txt(cameras, output_dir / "cameras.txt")
-    write_images_txt(images, output_dir / "images.txt")
-    write_points3d_txt(points, output_dir / "points3D.txt")
-    print(f"  [+] Saved {output_dir / 'cameras.txt'}")
-    print(f"  [+] Saved {output_dir / 'images.txt'}")
-    print(f"  [+] Saved {output_dir / 'points3D.txt'}")
-
-    # Also keep legacy directory updated
-    if legacy_aligned_dir != output_dir:
-        write_cameras_txt(cameras, legacy_aligned_dir / "cameras.txt")
-        write_images_txt(images, legacy_aligned_dir / "images.txt")
-        write_points3d_txt(points, legacy_aligned_dir / "points3D.txt")
-
-    # B. Nerfstudio transforms.json
-    transforms_path_scene = data_dir / "transforms.json"
-    transforms_path_aligned = output_dir / "transforms.json"
-    export_nerfstudio_transforms(cameras, images, transforms_path_scene, image_rel_prefix="images")
-    export_nerfstudio_transforms(cameras, images, transforms_path_aligned, image_rel_prefix="../images")
-    print(f"  [+] Saved {transforms_path_scene} (Nerfstudio OpenGL aligned format)")
-
-    # C. alignment.json
-    alignment_data = {
-        "scene": scene,
-        "convention": "right-handed Y-up metric (floor at y=0.0)",
-        "R": R_total.tolist(),
-        "t": (t_snap * scale_m_per_unit).tolist(),
-        "s": float(scale_m_per_unit),
-        "stats": {
-            "scale_mode": scale_method,
-            "target_phone_height_m": float(target_phone_height) if scale_method == "phone_height" else None,
-            "mean_camera_height_m": float(mean_h_m),
-            "std_camera_height_m": float(std_h_m),
-            "median_camera_height_m": float(med_h_m),
-            "min_camera_height_m": float(min_h_m),
-            "max_camera_height_m": float(max_h_m),
-            "plane_inliers": int(floor_result["inliers"]),
-            "floor_plane_angle_to_cam_up_deg": float(angle_to_up),
-            "floor_y_unscaled": float(floor_y_unscaled),
-            "room_extents_m": {
-                "x_width": round(x_span_m, 3),
-                "z_length": round(z_span_m, 3),
-                "y_ceiling": round(ceiling_h_m, 3),
-            },
-            "num_cameras": len(images),
-            "num_points": len(points),
-        },
-    }
-
-    alignment_path_scene = data_dir / "alignment.json"
-    alignment_path_aligned = output_dir / "alignment.json"
-    with open(alignment_path_scene, "w", encoding="utf-8") as f:
-        json.dump(alignment_data, f, indent=2)
-    with open(alignment_path_aligned, "w", encoding="utf-8") as f:
-        json.dump(alignment_data, f, indent=2)
-    print(f"  [+] Saved {alignment_path_scene}")
-
-    # Also save legacy align_report.json
-    pass_split = 201
+    print("\n[STEP 5] Metric scale recovery...")
+    # Determine passes / videos
+    # Pass 1: video1 or frames 1..pass_split
+    # Pass 2: video2 or frames > pass_split
+    pass_split = 222
     frames_rep_path = data_dir / "frames_report.json"
     if frames_rep_path.is_file():
         try:
             with open(frames_rep_path, "r", encoding="utf-8") as fr_f:
                 vids = json.load(fr_f).get("videos", [])
                 if vids:
-                    pass_split = vids[0].get("frames_kept", 201)
+                    pass_split = vids[0].get("kept_after_duplicate", vids[0].get("raw_extracted", 222))
         except Exception:
             pass
 
-    p1_hs = [c[1] for i, c in zip(inlier_iids, aligned_cams) if frame_number(images[i]["name"]) <= pass_split]
-    p2_hs = [c[1] for i, c in zip(inlier_iids, aligned_cams) if frame_number(images[i]["name"]) > pass_split]
-    p1_med = float(np.median(p1_hs)) if p1_hs else float(mean_h_m)
-    p2_med = float(np.median(p2_hs)) if p2_hs else float(mean_h_m)
+    # Separate camera heights by pass
+    p1_cams_unscaled = []
+    p2_cams_unscaled = []
 
-    rpt = {
+    for im in images.values():
+        C = camera_centre(im)
+        name = im["name"].lower()
+        f_num = frame_number(name)
+        if "video2" in name or ("video1" not in name and f_num > pass_split):
+            p2_cams_unscaled.append(C[1])
+        else:
+            p1_cams_unscaled.append(C[1])
+
+    mean_p1_unscaled = float(np.mean(p1_cams_unscaled)) if p1_cams_unscaled else float(np.mean([camera_centre(im)[1] for im in images.values()]))
+    mean_p2_unscaled = float(np.mean(p2_cams_unscaled)) if p2_cams_unscaled else mean_p1_unscaled
+
+    target_eye_h = float(align_cfg.get("eye_level_height_m", 1.45))
+    target_chest_h = float(align_cfg.get("chest_level_height_m", 1.15))
+
+    scale_method = scale_mode or align_cfg.get("scale_mode", "phone_height")
+    s = 1.0
+
+    # Mode (a): measurements.json point IDs or coords
+    meas_path = data_dir / "measurements.json"
+    meas_data = {}
+    if meas_path.is_file():
+        try:
+            with open(meas_path, "r", encoding="utf-8") as mf:
+                meas_data = json.load(mf)
+        except Exception:
+            pass
+
+    if scale_method == "points" and point_ids and known_distance:
+        p1_id, p2_id = point_ids
+        if p1_id in points and p2_id in points:
+            dist_u = float(np.linalg.norm(points[p1_id]["xyz"] - points[p2_id]["xyz"]))
+            s = known_distance / dist_u
+            print(f"  Mode (a) Point IDs [{p1_id}, {p2_id}]: dist = {dist_u:.4f} u, target = {known_distance:.3f} m -> Scale = {s:.5f} m/u")
+        else:
+            print("  [WARN] Specified point IDs not found; falling back to Mode (b).")
+            scale_method = "phone_height"
+    elif scale_method == "points" and point_coords and known_distance:
+        c1 = np.array(point_coords[:3])
+        c2 = np.array(point_coords[3:])
+        dist_u = float(np.linalg.norm(c1 - c2))
+        s = known_distance / dist_u
+        print(f"  Mode (a) Point Coordinates: dist = {dist_u:.4f} u, target = {known_distance:.3f} m -> Scale = {s:.5f} m/u")
+    else:
+        # Mode (b) Default: scale so eye level = 1.45 m
+        scale_method = "phone_height"
+        s = target_eye_h / mean_p1_unscaled if abs(mean_p1_unscaled) > 1e-4 else 1.0
+        print(f"  Mode (b) Reference: Eye level unscaled = {mean_p1_unscaled:.4f} u, Target = {target_eye_h:.2f} m -> Scale = {s:.5f} m/u")
+
+    # Apply uniform scale to points and cameras
+    for pt in points.values():
+        pt["xyz"] *= s
+
+    for im in images.values():
+        im["tx"] *= s
+        im["ty"] *= s
+        im["tz"] *= s
+
+    # Per-pass heights before and after
+    mean_p1_scaled = mean_p1_unscaled * s
+    mean_p2_scaled = mean_p2_unscaled * s
+    ratio_scaled = mean_p1_scaled / mean_p2_scaled if mean_p2_scaled > 1e-4 else 1.0
+
+    print("\n  Per-Pass Camera Heights:")
+    print(f"    Pass 1 (Eye level)   : Before = {mean_p1_unscaled:.4f} u, After = {mean_p1_scaled:.3f} m (Reference: {target_eye_h:.2f} m)")
+    if p2_cams_unscaled:
+        print(f"    Pass 2 (Chest level) : Before = {mean_p2_unscaled:.4f} u, After = {mean_p2_scaled:.3f} m (Check: {target_chest_h:.2f} m)")
+        print(f"    Eye / Chest Ratio    : {ratio_scaled:.2f}x")
+        if not (1.10 <= ratio_scaled <= 1.50):
+            print(f"    [WARNING] Eye/chest height ratio ({ratio_scaled:.2f}) is not between 1.1 and 1.5!")
+
+    # Room extents and ceiling height (robust point filtering: track length >= 4, error <= 1.0 px)
+    filtered_pts = []
+    for p in points.values():
+        t_tokens = p.get("track", "").split()
+        if len(t_tokens) // 2 >= 4 and float(p.get("error", 0.0)) <= 1.0:
+            filtered_pts.append(p["xyz"])
+
+    if len(filtered_pts) >= 50:
+        robust_pts = np.array(filtered_pts)
+    else:
+        robust_pts = np.array([p["xyz"] for p in points.values()])
+
+    x_p1, x_p99 = float(np.percentile(robust_pts[:, 0], 1)), float(np.percentile(robust_pts[:, 0], 99))
+    z_p1, z_p99 = float(np.percentile(robust_pts[:, 2], 1)), float(np.percentile(robust_pts[:, 2], 99))
+    robust_x_span = x_p99 - x_p1
+    robust_z_span = z_p99 - z_p1
+
+    aligned_cams = np.array([camera_centre(im) for im in images.values()])
+    cam_x_min, cam_x_max = float(np.min(aligned_cams[:, 0])), float(np.max(aligned_cams[:, 0]))
+    cam_z_min, cam_z_max = float(np.min(aligned_cams[:, 2])), float(np.max(aligned_cams[:, 2]))
+    cam_footprint_x = cam_x_max - cam_x_min
+    cam_footprint_z = cam_z_max - cam_z_min
+
+    # Ceiling determination following competition SOP
+    max_cam_h = float(np.max(aligned_cams[:, 1])) if len(aligned_cams) > 0 else 1.45
+    min_ceiling_h = max_cam_h + 0.5
+    is_synthetic = scene.startswith("synth") or not meas_path.is_file()
+    meas_ceiling = meas_data.get("ceiling_height_m") if not is_synthetic else None
+
+    if meas_ceiling is not None and float(meas_ceiling) > 0:
+        ceiling_h_m = max(float(meas_ceiling), min_ceiling_h)
+        ceiling_label = "measured"
+    else:
+        # Estimate ONLY from points inside camera footprint + 1.0m and above max camera height + 0.3m
+        box_mask = (
+            (robust_pts[:, 0] >= cam_x_min - 1.0) & (robust_pts[:, 0] <= cam_x_max + 1.0) &
+            (robust_pts[:, 2] >= cam_z_min - 1.0) & (robust_pts[:, 2] <= cam_z_max + 1.0) &
+            (robust_pts[:, 1] >= max_cam_h + 0.3)
+        )
+        ceil_candidates = robust_pts[box_mask]
+        if len(ceil_candidates) >= 500:
+            ceiling_h_m = max(float(np.percentile(ceil_candidates[:, 1], 95)), min_ceiling_h)
+            ceiling_label = "estimated"
+        else:
+            print("ceiling not reconstructed")
+            default_ceiling = float(
+                align_cfg.get("ceiling_default_m")
+                or cfg.get("alignment", {}).get("ceiling_default_m")
+                or cfg.get("alignment", {}).get("ceiling_height_m")
+                or 3.0
+            )
+            ceiling_h_m = max(default_ceiling, min_ceiling_h)
+            ceiling_label = "default"
+
+    print(f"\n  Camera-Loop Footprint (X x Z): {cam_footprint_x:.2f} m x {cam_footprint_z:.2f} m")
+    print(f"  Robust Point Extents  (X x Z): {robust_x_span:.2f} m x {robust_z_span:.2f} m")
+    print(f"  Ceiling Height               : {ceiling_h_m:.2f} m ({ceiling_label})")
+
+    # Compare against measurements.json if not synthetic
+    if not is_synthetic:
+        meas_list = meas_data.get("measurements", [])
+        ref_dim = None
+        for m in meas_list:
+            m_name = m.get("name", "")
+            if "square" in m_name or "side" in m_name or "footprint" in m_name:
+                ref_dim = float(m.get("metres", 0.0))
+                break
+        if ref_dim and ref_dim > 0:
+            diff_cam_x = ((cam_footprint_x - ref_dim) / ref_dim) * 100.0
+            diff_cam_z = ((cam_footprint_z - ref_dim) / ref_dim) * 100.0
+            diff_ext_x = ((robust_x_span - ref_dim) / ref_dim) * 100.0
+            diff_ext_z = ((robust_z_span - ref_dim) / ref_dim) * 100.0
+            print(f"  Measurements Comparison (vs {ref_dim:.2f} m reference):")
+            print(f"    Camera Footprint X: {cam_footprint_x:.2f} m ({diff_cam_x:+.1f}%) | Z: {cam_footprint_z:.2f} m ({diff_cam_z:+.1f}%)")
+            print(f"    Robust Extents   X: {robust_x_span:.2f} m ({diff_ext_x:+.1f}%) | Z: {robust_z_span:.2f} m ({diff_ext_z:+.1f}%)")
+
+        if meas_ceiling:
+            meas_c_val = float(meas_ceiling)
+            c_diff_pct = ((ceiling_h_m - meas_c_val) / meas_c_val) * 100.0
+            print(f"    Ceiling Height    : {ceiling_h_m:.2f} m vs Measured {meas_c_val:.2f} m ({c_diff_pct:+.1f}%)")
+
+    # -----------------------------------------------------------------------
+    # STEP 6: OUTPUTS
+    # -----------------------------------------------------------------------
+    print("\n[STEP 6] Saving aligned outputs...")
+    out_dir = Path(output_dir) if output_dir else (data_dir / "colmap_aligned")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Aligned COLMAP model in TXT and Binary form
+    write_cameras_txt(cameras, out_dir / "cameras.txt")
+    write_images_txt(images, out_dir / "images.txt")
+    write_points3d_txt(points, out_dir / "points3D.txt")
+    convert_model_to_bin_if_possible(out_dir, out_dir)
+    print(f"  [+] Saved aligned model: {out_dir} (TXT & BIN)")
+
+    # 2. transforms.json in Nerfstudio format
+    transforms_file = data_dir / "transforms.json"
+    export_nerfstudio_transforms(cameras, images, transforms_file, image_rel_prefix="images")
+    export_nerfstudio_transforms(cameras, images, out_dir / "transforms.json", image_rel_prefix="../images")
+    print(f"  [+] Saved Nerfstudio transforms.json: {transforms_file}")
+
+    # 3. alignment.json
+    alignment_summary = {
         "scene": scene,
-        "scale_m_per_unit": scale_m_per_unit,
-        "scale_method": scale_method,
-        "up_vector": floor_normal.tolist(),
-        "floor_angle_to_cam_up_deg": float(angle_to_up),
-        "yaw_rotation_deg": float(best_angle_deg),
-        "floor_y_colmap": float(floor_y_unscaled),
-        "pass_1_height_m": p1_med,
-        "pass_2_height_m": p2_med,
-        "ceiling_height_m": float(ceiling_h_m),
-        "n_images": len(images),
-        "n_points": len(points),
+        "convention": "right-handed Y-up metric (floor at y = 0.0, units = metres)",
+        "R": R_total.tolist(),
+        "t": (t_snap * s).tolist(),
+        "s": float(s),
+        "up_vector_detected": up_vector.tolist(),
+        "up_spread_deg": round(up_spread_deg, 3),
+        "floor_plane": {
+            "normal": chosen_plane["normal"].tolist(),
+            "height_unscaled": round(chosen_plane["height"], 4),
+            "inliers": chosen_plane["inliers"],
+            "angle_to_up_deg": round(chosen_plane["angle_to_up"], 2),
+        },
+        "per_pass_heights_m": {
+            "pass_1_eye": round(mean_p1_scaled, 3),
+            "pass_2_chest": round(mean_p2_scaled, 3) if p2_cams_unscaled else None,
+            "ratio": round(ratio_scaled, 2),
+        },
+        "camera_footprint_m": {
+            "width_x": round(cam_footprint_x, 3),
+            "length_z": round(cam_footprint_z, 3),
+        },
+        "robust_extents_m": {
+            "width_x": round(robust_x_span, 3),
+            "length_z": round(robust_z_span, 3),
+        },
+        "ceiling_height_m": round(ceiling_h_m, 3),
+        "ceiling_source": ceiling_label,
+        "room_extents_m": {
+            "width_x": round(robust_x_span, 3),
+            "length_z": round(robust_z_span, 3),
+            "height_y": round(ceiling_h_m, 3),
+        },
+        "num_cameras": num_images,
+        "num_points": num_points,
+        "reprojection_error_px": round(mean_reproj_error, 4),
     }
-    with open(data_dir / "align_report.json", "w", encoding="utf-8") as f:
-        json.dump(rpt, f, indent=2)
 
-    print("\nStage 3 Alignment Complete.")
+    with open(data_dir / "alignment.json", "w", encoding="utf-8") as f:
+        json.dump(alignment_summary, f, indent=2)
+    with open(out_dir / "alignment.json", "w", encoding="utf-8") as f:
+        json.dump(alignment_summary, f, indent=2)
+    print(f"  [+] Saved alignment.json: {data_dir / 'alignment.json'}")
+
+    # 4. Sparse init PLY point cloud
+    ply_path = out_dir / "points3D.ply"
+    write_points3d_ply(points, ply_path)
+    write_points3d_ply(points, data_dir / "points3D.ply")
+    print(f"  [+] Saved sparse init PLY: {ply_path}")
+
+    print("\nPhase 4 Scene Alignment completed successfully.")
+    return alignment_summary
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Phase 4: Metric, Gravity-Aligned, Y-up Scene Alignment.")
+    parser.add_argument("--scene", required=True, help="Scene name (subfolder under data/)")
+    parser.add_argument("--config", default="configs/default.yaml", help="Path to config YAML (default: configs/default.yaml)")
+    parser.add_argument("--input-model", default=None, help="Input COLMAP sparse model directory (default: best registered model)")
+    parser.add_argument("--output-dir", default=None, help="Output directory for aligned model (default: data/<scene>/colmap_aligned)")
+    parser.add_argument("--data-dir", default=None, help="Data directory override (default: data/<scene>)")
+    parser.add_argument("--floor-height", type=float, default=None, help="Manual floor height override")
+    parser.add_argument("--scale-mode", choices=["phone_height", "points"], default=None, help="Scale mode")
+    parser.add_argument("--point-ids", nargs=2, type=int, default=None, help="Two 3D point IDs for distance scaling")
+    parser.add_argument("--point-coords", nargs=6, type=float, default=None, help="Two 3D coordinates for distance scaling")
+    parser.add_argument("--distance", type=float, default=None, help="Known metric distance in metres")
+    args = parser.parse_args()
+
+    try:
+        align_scene(
+            scene=args.scene,
+            config_path=args.config,
+            input_model=args.input_model,
+            output_dir=args.output_dir,
+            data_dir=args.data_dir,
+            floor_height_manual=args.floor_height,
+            scale_mode=args.scale_mode,
+            point_ids=args.point_ids,
+            point_coords=args.point_coords,
+            known_distance=args.distance,
+        )
+    except Exception as e:
+        print(f"\n[FAIL] {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

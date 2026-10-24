@@ -1,57 +1,67 @@
-# Namma Space — default pipeline config
-# Override per-scene by passing --config <path>
-
-scene: "sample"          # scene name → data/<scene>/, outputs/<scene>/
-
-# ── Frame Extraction ─────────────────────────────────────────
+scene: sample
 extract_frames:
-  fps: 3                        # frames per second to extract via ffmpeg
-  quality: 95                   # JPEG quality (1-100)
-  max_dimension: 1920           # resize longest edge (null = no resize)
-  window_size: 1                # window size 1 to preserve dense continuous turnarounds
-  blur_percentile: 10.0         # drop only the bottom 10% blurriest frames
-  duplicate_threshold: 0.985    # SSIM threshold to drop near-duplicate stationary frames
-  max_frames: 450               # cap final frame count by uniform subsampling
-  min_frames_warn: 120          # warn if final frame count falls below 120
-  contact_sheet_cols: 8         # contact sheet grid columns
-  contact_sheet_rows: 6         # contact sheet grid rows
-
-# ── Structure-from-Motion (COLMAP) ───────────────────────────
+  fps: 3
+  quality: 95
+  max_dimension: 1920
+  window_size: 1
+  blur_percentile: 10.0
+  duplicate_threshold: 0.985
+  max_frames: 450
+  min_frames_warn: 120
+  contact_sheet_cols: 8
+  contact_sheet_rows: 6
 sfm:
-  camera_model: "OPENCV"        # OPENCV (default) | SIMPLE_RADIAL | PINHOLE
+  camera_model: SIMPLE_RADIAL
   use_gpu: true
-  matcher: "sequential"         # sequential (with loop detection) | exhaustive when <= 300
-  mapper: "incremental"         # global (global_mapper) | incremental (mapper)
-  min_registered_ratio: 0.85    # minimum registration fraction to pass (85%)
-  feature_type: "SIFT"          # SIFT (default) | ALIKED
-  sequential_overlap: 20        # overlap for sequential matcher
-
-# ── Gravity / Scale Alignment ────────────────────────────────
+  matcher: sequential
+  mapper: incremental
+  min_registered_ratio: 0.85
+  feature_type: SIFT
+  sequential_overlap: 20
+align:
+  input_model: colmap_runs/E3/sparse/0
+  eye_level_height_m: 1.45
+  chest_level_height_m: 1.15
+  max_floor_angle_deg: 8.0
+  min_inlier_ratio: 0.015
+  max_planes: 6
+  floor_height_manual: null
+  dist_thresh: 0.05
 alignment:
-  method: "gravity"            # gravity | manual
-  phone_height_m: 1.45         # default assumed camera height above floor in metres
-  scale_reference_m: null      # known distance in metres (null = auto)
-  ceiling_height_m: 4.10       # ground truth ceiling height in metres (crop height in Phase 6)
-
-# ── Gaussian Splat Training ──────────────────────────────────
+  input_model: colmap_runs/E3/sparse/0
+  method: gravity
+  phone_height_m: 1.45
+  eye_level_height_m: 1.45
+  chest_level_height_m: 1.15
+  max_floor_angle_deg: 8.0
+  min_inlier_ratio: 0.015
+  max_planes: 6
+  floor_height_manual: null
+  dist_thresh: 0.05
+  scale_reference_m: null
+  ceiling_height_m: 4.1
 splat:
-  backend: "brush"              # nerfstudio (ns-train splatfacto, CUDA) | brush (no CUDA)
-  preset: "fast"                # fast (7k steps smoke test) | final (30k steps, SH degree 3)
-  eval_ratio: 0.1               # hold out ~10% of frames for PSNR/SSIM/LPIPS evaluation
+  backend: brush
+  preset: final
+  eval_ratio: 0.1
   iterations: 30000
   sh_degree: 3
   densify_until_iter: 15000
   position_lr_init: 0.00016
   scaling_lr: 0.005
-
-# ── Post-processing ─────────────────────────────────────────
 postprocess:
   compress: true
-  max_gaussians: 2_000_000  # prune if above this count
-
-# ── Scene convention (do not change) ─────────────────────────
+  max_gaussians: 2000000
+  max_splats: 0
+  crop_margin_m: 4.0
+  walkable_radius_m: 1.5
+  min_opacity: 0.05
+  max_scale_m: 0.5
+  occupancy_cell_size_m: 0.1
+  occupancy_min_points: 8
+  occupancy_inflation_m: 0.2
 convention:
-  up: "Y"
-  handedness: "right"
-  units: "metres"
+  up: Y
+  handedness: right
+  units: metres
   floor_y: 0.0

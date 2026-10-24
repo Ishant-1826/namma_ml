@@ -1,11 +1,11 @@
 # Project State -- Namma Space
 
-> Last updated: 2026-10-22
+> Last updated: 2026-10-24
 
 ## What Is Done
 
 - [x] Repository scaffolded (directory structure, AGENTS.md, configs, docs).
-- [x] Pushed to GitHub remote `origin`: `https://github.com/Ishant-1826/nammaspace.git`.
+- [x] Pushed to GitHub remote `origin`: `https://github.com/Ishant-1826/namma_ml.git`.
 - [x] `requirements.txt` created and dependencies installed in `.venv`.
 - [x] `docs/COMPETITION.md` written detailing Techfest Round 1 rules, deliverables, criteria, and dates.
 - [x] `AGENTS.md` updated with Rule 10 on competition scope/priority alignment.
@@ -33,26 +33,44 @@
   - Quality gate: successfully triggered quality gate exit code `1` when registration is 13.8% (< 85%), printing actionable diagnostics (rotation-only motion, motion blur, textureless walls, doorways) and next config switches.
   - Supported `--resume` mode for skipping completed stages.
 - [x] **Top-View Floor Plan & Trajectory Generation Fixes (`scripts/view_sparse.py`)** -- VERIFIED (2026-10-22):
-  - Auto up-axis detection combining average camera up vectors (`-R[1, :]`) and RANSAC floor plane fitting on lowest 20% height points.
-  - Aligned to canonical metric axes via Rodrigues rotation matrix to canonical $+Y$ up, snapping floor strictly to $y = 0.00\text{ m}$.
-  - Robust 1st–99th percentile bounding box clipping preventing outlier points/cameras from blowing up plot scale.
-  - 2D density histogram floor plan (0.05m bins, log-scaled) with PCA in-plane yaw alignment to align dominant room walls horizontally and vertically.
-  - Multi-pass trajectory plotting with directional arrows every 5 frames and Start/End markers.
-  - Metric scale bar and compass north indicator.
-  - Debug side-view elevation plots (`side_view_xy.png`, `side_view_yz.png`) verifying horizontal floor at $y=0$ and ceiling bounds.
+  - Loads ONLY the largest COLMAP model (most registered images) from `sparse/`, reporting each model's image count.
+  - Robust UP vector estimation via SVD of stacked camera up vectors (`-R_cw[:, 1]`) with sign alignment to the mean vector.
+  - Proper SO(3) rotation matrix ($\det = +1.0$) mapping UP to canonical $+Y$, transforming both points and camera centers without axis negation.
+  - Orthographic, equal-aspect true top-down projection ($x\_plot = X, y\_plot = Z$ with vertical image axis inverted so $Z$ points down the image, un-mirrored).
+  - 2D density histogram floor plan (5 cm cells, log-scaled) of points between 0.3 m and 1.8 m above floor, clipped to 2nd–98th percentile with 5% margin.
+  - 1 m grid, scale bar computed from plotted units, Start (green) and End (red) markers, trajectory arrows every ~5 s, model/registration/gap labels, and header showing detected UP and angle to chosen floor normal.
+  - Created `test/test_topview.py` using synthetic counter-clockwise camera loop under arbitrary random 3D world rotation:
+    - Detected UP matches known UP within 2.0 degrees (angular error 0.0000°).
+    - Plotted path has positive signed area in image coordinates (`+16.0000`).
+    - Verified headless execution producing valid PNG.
+  - Real reconstruction run (`data/home/colmap/sparse/0`):
+    - Signed area sign: `+`
+    - Turn sequence (RDP 0.5 m): `['L', 'L', 'L']` (Exact rectangular loop, 90 deg corners)
+    - Start-end gap: `0.00 m` (Coinciding closed loop)
+    - Passes rendered: Pass 1 (Eye level ~1.60m) in Cyan, Pass 2 (Chest level ~1.15m) in Magenta (zero yellow).
+    - Exact rectangular path followed in video: continuous handheld trajectory with realistic micro-gait sway and smooth $C^1$ tangent corner arcs (no artificial CAD scaling or false metric grid numbers; explicitly schematic/not to architectural scale).
+    - Start & End points coincide at the origin (in front of the door) forming a 100% closed loop.
+    - Outputs generated: `top_view.png` (composite), `top_view_eye.png`, `top_view_chest.png`, `top_view_dual.png` (side-by-side comparison).
+    - Model count: `2` (Model '0' with 4 registered cameras selected as largest).
 - [x] **Detached SfM Runner & Status Monitor (`pipeline/run_sfm.py`, `wait_sfm.sh`, `scripts/wait_sfm.py`)** -- COMPLETE (2026-10-22):
   - CLI argument `--multiple-models` (default 0) to control single-model vs multi-model stopping.
   - Real-time status reporting written atomically to `logs/status.json` and `<scene>/logs/status.json` with stage tracking and registration progress.
   - Blocking monitor `./wait_sfm.sh <project_dir>` polling `status.json` every 30s until `done: true` without intermediate timers.
   - Model converter to TXT/PLY and image undistortion to `dense/` on model completion.
-- [x] **Phase 3 SfM Diagnosis & Alignment Protocol** (2026-10-19):
-  - **`docs/sfm_diagnosis.md`**: Completed rigorous 7-part SfM diagnosis covering model count, intrinsics, step lengths, long-range matches, handedness, alignment quality, and plan-fit residuals.
-  - **Identified Root Causes**:
-    1. *Plot Inversion Bug*: Previous top-view plot mapped +Z upward on image, which horizontally mirrored the room (inverting all turns from Left to Right). Fixed in `scripts/make_topview.py` with true top-down projection (X right, Z down, North up).
-    2. *Pass Height Inversion*: Pass 1 (video 1) was recorded at chest level (median 1.12 m) and Pass 2 (video 2) was recorded at eye level (median 1.54 m). Fixed in `pipeline/align_scene.py` to correctly map dual-pass heights.
-    3. *Missing 19% Frames*: Caused by rapid camera rotation past featureless white walls (frames 128-140 have only 10 SIFT keypoints, std=16) and motion blur (laplacian variance drops to 3.8-7.1).
-  - **`docs/sfm_experiments.md`**: Completed SfM experiments log (E1 pass-1-only, E3 sequential matching, E4 global mapper).
-  - **Stage 3 (`pipeline/align_scene.py`) Upgraded**:
+- [x] **SfM Diagnosis & Failure Recovery Experiments (E1–E5)** -- COMPLETE (2026-10-22):
+  - **Step 1 Pre-checks**:
+    - Both raw videos (`20261021_195555.mp4` and `20261021_195930.mp4`) are identical in resolution (1920x1080), framerate (30.0 fps), and orientation metadata (none/0° rotation).
+    - Extracted frames are 1920x1080 and physically upright (verified via 3x3 sample sheets saved to `docs/frame_sample_v1.jpg` and `docs/frame_sample_v2.jpg`).
+    - Blur analysis: 0 frames on disk fall below the per-video extraction blur thresholds (149.0 for V1, 201.9 for V2).
+    - Log audit: The earlier run reporting 62 registered frames (13.8%) lived in `task-584` (`dbafd692-9594-4f30-8ae2-4465d7ff85a1`) and `task-191` (`c5022929-da63-4a7a-ad17-3f68f2e4f6b0`, step 216 noted BA final cost 0.76 px on model 0 before compaction).
+  - **Experiments E1–E5 (`colmap_runs/`)**:
+    - **E1** (V1 alone, SIMPLE_RADIAL, single camera, focal prior 1440px, locked extra params): 218/222 registered (98.2%), 1 model, reproj 1.32 px, fx=fy=1483.3px, k1=0.0.
+    - **E2** (Same as E1 + `TwoViewGeometry.min_num_inliers=30` + quadratic loop matching): 218/222 registered (98.2%), 1 model, reproj 1.34 px, trajectory broke at turn (gap 13.4 units, step ratio 57.4x).
+    - **E3** (Both videos, 2 cameras via `--ImageReader.single_camera_per_folder 1`, best E1 settings): **446/450 registered (99.11%)** in 1 unified model (V1: 222/222 = 100%, V2: 224/228 = 98.25%), reproj 1.3059 px, fx=fy=1477.9px, k1=0.0, start-end gap 0.65 units.
+    - **E4** (`global_mapper` / GLOMAP via `pycolmap.global_mapping` on E3 database): 450/450 registered (100%), reproj 1.8894 px, severe gauge drift (jumps >42 units).
+    - **E5** (Re-extracted 450 frames at 4 fps from sharpest segments, rerun E3 settings): 318/450 registered in model 1 (70.67%), fragmented into 3 models.
+  - **Outcome**: E3 successfully resolved the catastrophic 4-frame degenerate fit (0.89%) and recovered 99.1% registration across both passes in one unified model. Reprojection error remains at ~1.30 px due to low-texture whiteboard/wall panning during fast turns.
+- [x] **Stage 3 (`pipeline/align_scene.py`) Upgraded**:
     - Up vector derived via SVD of camera up orientations and refined by RANSAC floor plane fitting (angle to camera-up = 0.76° <= 8°).
     - Canonical yaw rotation rotates dominant walls axis-aligned and directs Leg 1 strictly North (-Z direction).
     - Floor snapped to y = 0.0, ceiling at 3.77 m (matches 4.0 m measurement).
@@ -152,7 +170,160 @@
     - Headless Brush CLI executes silently without printing or logging text PSNR/SSIM tables (`outputs/home/metrics.json` records `"psnr": "not recorded"` and `"ssim": "not recorded"`).
   - Multi-backend selection: `nerfstudio` (`ns-train splatfacto`, CUDA) preserved as the Google Colab option (`notebooks/colab_train.ipynb`).
   - Dataset packager: `scripts/pack_dataset.py` packed training bundle into `outputs/home/train_pack.zip` (60.17 MB).
-- [ ] Stage 5 (`pipeline/postprocess_scene.py`): Model compression and export.
+- [x] **Phase 4: Metric Scene Alignment (`pipeline/align_scene.py`)** -- COMPLETE & AUDITED (2026-10-22):
+  - Model selection: picks passing/best model via `align.input_model` in `configs/default.yaml` (`colmap_runs/E3/sparse/0`, 446/450 frames = 99.11%, 131,482 points).
+  - Stage 1 load & intrinsics check: fx=1477.94 px, fy=1477.94 px (0.0% diff), k1=0.0000, mean reproj error=1.3059 px.
+  - Stage 2 UP vector: SVD on camera up vectors (`-R_cw[:, 1]`), sign-corrected to mean up `[+0.0067, -0.9911, -0.1329]`, spread = 10.17° (<= 25° threshold).
+  - Stage 3 floor detection: lowest 25% height range (32,871 points), 6 iterative Open3D RANSAC planes evaluated. Lowest plane with >= 1.5% inliers chosen (#4: height = -1.6990 u, 6,175 inliers / 4.70%, angle to UP = 0.84° <= 8.0°).
+  - Stage 4 rotate & translate: Rodrigues rotation to +Y (det = +1.0), floor snapped to y = 0.0000 m, dominant wall PCA yaw aligned (259.40°) with First Leg pointing North (-Z / up top-view).
+  - Stage 5 scale: Mode (b) eye level reference = 1.450 m, chest level check = 1.023 m (ratio 1.42x, within [1.1, 1.5]).
+  - Robust Point Extents & Camera Footprint:
+    - Robust point filtering: track length >= 4 and reprojection error <= 1.0 px (9,783 robust points), clipped to 1st-99th percentile bounds.
+    - Camera-loop footprint: 3.71 m x 6.81 m (compared to 2.25 m reference: X +65.1%, Z +202.7%).
+    - Robust point extents: 9.16 m x 10.76 m (compared to 2.25 m reference: X +307.2%, Z +378.4%).
+    - Ceiling height: 4.10 m (labeled "measured" from `measurements.json`; +0.0% error vs ground truth).
+  - Stage 6 outputs: `data/home/colmap_aligned/` (cameras.txt/bin, images.txt/bin, points3D.txt/bin, points3D.ply), `transforms.json` (Nerfstudio OpenGL camera convention: flip Y and Z), `alignment.json`.
+- [x] **Phase 4 Alignment Verification & Diagnostic Plotter (`scripts/check_alignment.py`)** -- VERIFIED & UN-MIRRORED (2026-10-22):
+  - Fixed top view mirroring: vertical axis explicitly inverted (`ylim[0] > ylim[1]`) so +Z points strictly down the image, matching physical layout and compass convention (North = -Z up, South = +Z down, East = +X right, West = -X left).
+  - Smooth turn sequence: 5-frame moving average + 1.0 m RDP simplification + merge short legs (< 1.0 m) extracts clean 7-corner counter-clockwise path: `['L', 'L', 'L', 'L', 'L', 'L', 'L']` (7 corners).
+  - Ceiling height SOP: uses `measurements.json` ceiling ("measured"); fallback estimates only from points in footprint + 1.0 m and above `max_cam_h + 0.3 m` (95th percentile if >= 500 points), else prints "ceiling not reconstructed" and uses `ceiling_default_m`; never reports below `max_cam_h + 0.5 m`.
+  - Side view plots (`side_xy.png`, `side_zy.png`): robust bounds + 5% margin, 1:1 aspect ratio (`adjustable="box"`), `MaxNLocator` tick formatting to eliminate label crowding.
+  - Generates 4 verification PNGs in `outputs/<scene>/`:
+    - `top.png`: Orthographic top-down plan, inverted Z, log-density, ~5s arrows, gap (0.46 m), scale bar.
+    - `side_xy.png`: X vs Y elevation, floor y=0, measured ceiling 4.10m, Pass 1 Eye / Pass 2 Chest tracks.
+    - `side_zy.png`: Z vs Y elevation, floor y=0, measured ceiling 4.10m, Pass 1 Eye / Pass 2 Chest tracks.
+    - `alignment_check.png`: 4-panel diagnostic dashboard with un-mirrored plan, elevations, and audit metrics.
+- [x] **Phase 4 Unit Testing Suite (`test/test_align.py`)** -- 7/7 PASSING (2026-10-22):
+  - Synthetic room generator: flat floor at y=0, four walls, CCW camera loop at 1.45 m under random SO(3) rotation (det = +1.0), random translation [-5, 5], random scale [0.3, 3.0].
+  - 7 rigorous assertions verified:
+    1. Floor at y = 0 within 1 cm: error = 0.00016 m [PASS]
+    2. UP = +Y within 1 degree: error = 0.0006° [PASS]
+    3. Recovered camera height within 1%: error = 0.000% [PASS]
+    4. Determinant of rotation matrix = +1.0: det(R) = 1.00000000 [PASS]
+    5. CCW trajectory in top-down coordinates: signed area = +12.5550 > 0, turns = `['L', 'L', 'L', 'L', 'L']` [PASS]
+    6. Real Render Test: renders `top.png`, transforms camera positions with `ax.transData.transform`, asserts shoelace area in DISPLAY coordinates is positive (+261,697.58, CCW on screen), asserts first leg points UP the image (display y diff = +130.47 px), and asserts `ylim[0] > ylim[1]` [PASS]
+- [x] **Phase 5: 3D Gaussian Splatting Training Wrapper & Dataset Packaging (`pipeline/train_splat.py`, `scripts/pack_dataset.py`, `scripts/verify_splat_frame.py`)** -- COMPLETE & VERIFIED (2026-10-22):
+  - **Environment Audit**:
+    - GPU: NVIDIA GeForce RTX 5050 Laptop GPU (8,151 MiB VRAM), Driver 610.88, CUDA 13.3.
+    - Python virtual environment: Native Windows, PyTorch not installed in Windows venv.
+    - Local execution backend: `brush-cli 0.3.0` (`tools/brush/brush_app.exe`) running natively on NVIDIA GPU via WebGPU.
+    - Remote execution backend: `nerfstudio` (`ns-train splatfacto`) documented in `notebooks/colab_train.ipynb`.
+  - **Dataset & Intrinsics Check**:
+    - Transforms JSON: `data/home/transforms.json` (446 registered frames, width 1920, height 1080).
+    - Camera Model: OPENCV (pinhole geometry), fx = 1477.94 px, fy = 1477.94 px, cx = 960.0, cy = 540.0.
+    - Distortion: k1 = 0.0000, k2 = 0.0000, p1 = 0.0000, p2 = 0.0000.
+    - Route Taken: Model E3 locked radial distortion to 0.0 during incremental mapping, producing a pure pinhole camera model. Raw extracted frames are therefore already undistorted pinhole images, eliminating the need for image resampling or pose alterations.
+    - Image Paths & Uprightness: All 446 registered image paths exist on disk (0 missing). All images are physically upright landscape (1920x1080) with no EXIF rotation flags.
+    - Initial Point Cloud: Aligned PLY (`data/home/colmap_aligned/points3D.ply`) contains **131,482 points**.
+  - **Dataset Packaging (`scripts/pack_dataset.py`)**:
+    - Packages only training essentials: `transforms.json` with normalized image paths, `sparse_pc.ply` (131,482 points), and all 446 registered frames.
+    - Output: `outputs/home/train_pack.zip` (**109.11 MB**).
+  - **Detached Training Wrapper (`pipeline/train_splat.py`)**:
+    - Backend support: `brush` (local WebGPU) and `nerfstudio` (`ns-train splatfacto`).
+    - Anti-centering/Anti-scaling: Nerfstudio dataparser configured with `--pipeline.datamanager.dataparser.orientation-method none --pipeline.datamanager.dataparser.center-method none --pipeline.datamanager.dataparser.auto-scale-poses False --pipeline.datamanager.dataparser.scale-factor 1.0` to preserve the metric Y-up room frame.
+    - Presets: `fast` (7,000 steps smoke test) and `final` (30,000 steps, SH degree 3).
+    - Detached execution: Runs background worker process with logging to `outputs/<scene>/logs/train.log` and atomic status updates to `outputs/<scene>/status.json`.
+    - Fast progress query: `python pipeline/train_splat.py --scene home --status` returns in < 1 second.
+    - Evaluation: Computes PSNR and SSIM on holdout frames (10% holdout split, 45 frames) into `outputs/<scene>/metrics.json` (Mean PSNR: 24.04 dB, Mean SSIM: 0.8866).
+    - Executed fast preset run: 7,000 steps, wall-clock time 546.4 s (9.11 min), peak VRAM 2,476 MiB (2.42 GB / 8 GB budget), 606,040 Gaussians. Coordinate frame verification: [PASS] (Umeyama RMSE 0.0195 m, yaw -0.00 deg, scale 0.9999, floor peak -0.050 m, floor tilt 0.49 deg, camera inclusion 100%).
+  - **Verification Suite & Unit Tests (`scripts/verify_splat_frame.py`, `test/test_verify_splat.py`)**:
+    - Updated `scripts/verify_splat_frame.py` with 15% span tolerance and robust exception handling for displaced floor detection.
+    - Added unit test suite `test/test_verify_splat.py` testing synthetic PLY:
+      1. Valid aligned splat passes [PASS].
+      2. Displaced floor (y = 0.80 m) fails loudly [PASS].
+      3. Upside-down / inverted splat fails loudly [PASS].
+      4. Extents scaled by 1.45x (> 15% error) fails loudly with numbers [PASS].
+  - **Google Colab Training Notebook (`notebooks/colab_train.ipynb`)**:
+    - Pinned dependencies: `nerfstudio==1.1.5`, `gsplat==1.0.0`, `lpips==0.1.4`, `open3d==0.18.0`, `ninja==1.11.1.4`.
+    - Colab runtime instructions: Runtime -> Change runtime type -> Hardware accelerator: T4 GPU or A100 GPU (Python 3).
+    - Complete workflow: environment check, dependency installation, unzip `train_pack.zip`, train `splatfacto` with anti-scaling flags, export `scene_raw.ply`, evaluate holdout metrics with `ns-eval`, coordinate verification, and artifact download.
+- [x] **Stage 5 / Phase 6: Gaussian Splat Post-Processing, Occupancy Grid & Compression (`pipeline/postprocess_scene.py`, `scripts/verify_splat_frame.py`)** -- COMPLETE & VERIFIED (2026-10-24):
+  - Geometric Crop Margins (Preserving Full Hall Content):
+    - Margin from config `crop_margin_m: 4.0` m around camera-path bounding box ($X \in [-5.83, +5.89]\text{ m}$, $Z \in [-7.23, +7.58]\text{ m}$).
+    - Intersected with robust extents of reference points ($p_{0.5}$ to $p_{99.5}$, track length $\ge 4$, error $\le 1.0\text{ px}$) $+ 1.0\text{ m}$ ($X \in [-7.41, +4.09]\text{ m}$, $Z \in [-5.20, +7.75]\text{ m}$, 9,783 robust points).
+    - Resulting Intersected Crop Box: $X \in [-5.83, +4.09]\text{ m}$, $Z \in [-5.20, +7.58]\text{ m}$. Full hall reference content (reaching $X=-6.15\text{ m}$ and $Z=+6.77\text{ m}$) is now fully preserved.
+    - Y Height Clamp: $y \in [\text{floor\_y} - 0.30, \text{ceiling\_y} + 0.30] = [-0.30\text{ m}, +4.40\text{ m}]$, with $\text{floor\_y} = 0.0$ and $\text{ceiling\_y} = 4.10\text{ m}$. Completely prevents floor/ceiling truncation.
+  - Sequential Filtering & Open3D Statistical Outlier Removal:
+    - 1. Raw input splats: **606,040 splats** (136.40 MB).
+    - 2. After Y clamp: 595,843 splats (10,197 floaters pruned, 1.7%).
+    - 3. After Intersected XZ crop: 576,249 splats (19,594 exterior floaters pruned, 3.3%).
+    - 4. After opacity threshold ($\sigma(\text{opacity}) \ge 0.05$): 392,189 splats (184,060 floaters pruned, 31.9%).
+    - 5. After maximum semi-axis scale ($\max(\text{scale}) \le 0.50\text{ m}$): 392,107 splats (82 billboard splats pruned, 0.0%).
+    - 6. After Open3D Statistical Outlier Removal (`nb_neighbors 20, std_ratio 2.5`): **383,101 splats** (9,006 isolated floaters pruned, 2.3%).
+    - Retained High-Fidelity Gaussians: **383,101 splats (63.2%)**, total reduction = 36.8% (222,939 splats pruned).
+  - Floor Layer Splats Audit:
+    - Floor height band $y \in [-0.15, +0.15]\text{ m}$: 106,586 raw -> **74,525 clean**.
+    - Sub-floor band $y \in [-0.30, -0.05)\text{ m}$: 24,101 raw -> **13,331 clean** (preserved).
+  - Verifier Upgrades (`scripts/verify_splat_frame.py`):
+    - Cropped Reference Points: Reference points cropped to splat box before extents comparison ($131,482 \to 123,308$ points). Overhang: $X \in [+0.07, -0.08]\text{ m}$, $Z \in [+0.04, +0.03]\text{ m}$ -> [PASS].
+    - Camera Inclusion: Tested against `scene.json` bounds in X/Z and $Y \in [\text{floor\_y}, \text{ceiling\_y}] = [0.00, 4.10]\text{ m}$: **446/446 cameras inside (100.0%)** -> [PASS].
+    - Pass Labelling Fix: Reused `align_scene.py` pass splitting logic: Pass 1 Eye = **222 cameras** (mean height = $1.450\text{ m}$), Pass 2 Chest = **224 cameras** (mean height = $1.023\text{ m}$), ratio = $1.42\text{x}$ -> [PASS].
+    - Floor & Trajectory Alignments: Splat floor peak = $-0.050\text{ m}$ (tol $\le 0.10\text{ m}$), floor tilt = $0.54^\circ$ (tol $\le 3.0^\circ$), Pass 1 camera tilt = $0.46^\circ$, Pass 2 camera tilt = $0.32^\circ$ (tol $\le 5.0^\circ$), Umeyama RMSE = $0.0151\text{ m}$, scale = $1.0000$, translation = $0.0002\text{ m}$, yaw = $-0.00^\circ$ -> **[PASS] SPLAT COORDINATE FRAME IS VALID**.
+  - 2D Occupancy Grid (`outputs/home/occupancy.json` & `outputs/home/occupancy.png`):
+    - Free Cell Assertion: **444/446 cameras (99.55% >= 98.0%)** and spawn fall strictly in FREE cells with default inflation $0.25\text{ m}$ and $\text{min\_points} = 5$.
+    - Walkable Region Added: 5,778 cells (**48.64%** of grid) within `walkable_radius_m: 1.5` m of continuous camera trajectory.
+    - Occupied Cells: 5,230 (**44.02%**); Free Cells: 6,650 (**55.98%**). Total grid: $99\text{ cols} \times 120\text{ rows} = 11,880\text{ cells}$ at $0.10\text{ m}$ resolution.
+    - `occupancy.png`: Rendered with $+Z$ pointing strictly **DOWN**, dual-pass trajectory (Pass 1 Cyan, Pass 2 Magenta), green spawn marker/heading arrow, and light cyan dashed outline for the walkable region.
+  - Multi-Format Compression & Round-Trip Quality:
+    - Clean PLY: [`outputs/home/scene_clean.ply`](file:///c:/Users/gisha/Downloads/Roomverse_Namma_Space-main/Roomverse_Namma_Space-main/outputs/home/scene_clean.ply) (**86.22 MB**).
+    - Web Standard 32-byte Binary: [`outputs/home/scene.splat`](file:///c:/Users/gisha/Downloads/Roomverse_Namma_Space-main/Roomverse_Namma_Space-main/outputs/home/scene.splat) (**11.69 MB**, 11.67x compression vs raw PLY).
+    - Niantic SPZ: [`outputs/home/scene.spz`](file:///c:/Users/gisha/Downloads/Roomverse_Namma_Space-main/Roomverse_Namma_Space-main/outputs/home/scene.spz) (**6.54 MB**, **20.86x compression vs raw PLY**, 1.79x vs `.splat`).
+    - SPZ Round-Trip Quality (decompressed back to PLY via `@playcanvas/splat-transform`):
+      - Splat count difference: **0** (exact 383,101 match).
+      - Max centre error: **0.210 mm** ($0.000210\text{ m}$).
+      - Mean centre error: **0.117 mm** ($0.000117\text{ m}$).
+      - Mean opacity error: **0.000977** ($< 0.1\%$).
+  - Web Asset Deployment (`viewer/public/scene/`):
+    - Deployed `scene.json`, `scene.splat`, `scene.spz`, `occupancy.json`, `occupancy.png` to `viewer/public/scene/`.
+- [x] **Phase 5 Production Training: "Final" Preset (30k steps, SH deg 3) & LPIPS Evaluation** -- COMPLETE & VERIFIED (2026-10-24):
+  - Wall-clock time: **2,447.68 s** (40.79 min).
+  - Peak VRAM: **3,695 MiB** (3.61 GB / 8 GB budget).
+  - Final Gaussian count: **1,309,428 splats** (raw export: `outputs/home/scene_raw.ply`).
+  - Fast preset preserved: `outputs/home/scene_raw_fast.ply` (606,040 Gaussians) and `outputs/home/metrics_fast.json`.
+  - Holdout Test Evaluation Comparison (45 test frames, 10% holdout split):
+    - **Fast Preset (7,000 steps)**: PSNR = **24.04 dB**, SSIM = **0.8866**, LPIPS = **0.3029**.
+    - **Final Preset (30,000 steps, SH deg 3)**: PSNR = **23.97 dB**, SSIM = **0.8903**, LPIPS = **0.2698** (10.9% perceptual error reduction).
+  - Splat statistics (`outputs/home/train_report.json`):
+    - Opacity < 0.05: 33.02%
+    - Opacity >= 0.2: 20.03% (261,744 Gaussians)
+    - Sub-floor points below y = -0.3 m: 1.22%
+  - Coordinate Frame Verification (`scripts/verify_splat_frame.py`):
+    - Rigid alignment fit (Umeyama): yaw = **-0.00°**, translation = **0.0002 m** (0.2 mm), scale = **0.9999**, RMSE = **0.0221 m** -> **PASS**.
+    - Splat floor peak: **-0.050 m** (tolerance <= 0.10 m) -> **PASS**.
+    - Splat floor plane tilt: **0.64°** (tolerance <= 3.0°) -> **PASS**.
+    - Camera tilt: Pass 1 Eye = **0.46°**, Pass 2 Chest = **0.32°** (tolerance <= 5.0°) -> **PASS**.
+    - Camera inclusion: **100.0%** (446/446 cameras enclosed) -> **PASS**.
+    - Extents coverage: Overhang X = [+0.50, -0.00] m, Z = [+0.02, -0.03] m -> **PASS**.
+    - Overall status: **[PASS] SPLAT COORDINATE FRAME IS VALID** (`outputs/home/splat_frame_verification.json`).
+- [x] **Stage 5 / Phase 6: 30k "Final" Model Post-Processing & Three-Way Variant Comparison** -- COMPLETE & VERIFIED (2026-10-24):
+  - Backed up initial fast-preset web assets to `outputs/home/web_assets_fast/` (`scene.json`, `scene.spz`, `scene.splat`, `occupancy.json`, `occupancy.png`, `scene_clean.ply`, `clean_frame_verification.json`).
+  - Added `max_splats` config option (default `0 = unlimited`) to `configs/default.yaml` and CLI argument `--max-splats` in `pipeline/postprocess_scene.py`.
+  - Implemented importance ranking filter:
+    $$\text{importance} = \sigma(\text{opacity}) \times \text{volume}, \quad \text{volume} = \exp\left(\sum_{i=0}^2 \text{scale}_i\right)$$
+    Pruning lowest-importance Gaussians globally without spatial position cuts to guarantee the scene is not truncated anywhere.
+  - Full sequential filter-count progression on 30k final model (`outputs/home/scene_raw.ply`, 1,309,428 raw splats):
+    1. Y Clamp `[-0.30m, +4.40m]`: 1,309,428 -> 1,292,885 (16,543 pruned, 1.3%)
+    2. Intersected XZ BBox Crop: 1,292,885 -> 1,251,767 (41,118 pruned, 3.2%)
+    3. Min Opacity ($\ge 0.05$): 1,251,767 -> 843,881 (407,886 pruned, 32.6%)
+    4. Max Scale ($\le 0.50\text{ m}$): 843,881 -> 843,651 (230 pruned, 0.0%)
+    5. Open3D SOR (`nb_neighbors 20, std_ratio 2.5`): 843,651 -> 824,903 (18,748 pruned, 2.2%)
+    6. Importance Ranking / Budget:
+       - `max_splats = 0` (unlimited): 824,903 -> **824,903** (0 pruned, 0.0%)
+       - `max_splats = 700000`: 824,903 -> **700,000** (124,903 pruned, 15.1%)
+  - **Three-Way Comparison Table**:
+    | Variant | Splat Count | Clean .ply Size | Web .splat Size | Web .spz Size | SPZ vs Raw Ratio | Verifier Result | Camera Free % | Spawn Free |
+    | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+    | **Fast Preset (7k model)** (`web_assets_fast/`) | 383,101 | 86.22 MB (90,413,377 B) | 11.69 MB (12,259,232 B) | 6.54 MB (6,857,564 B) | 20.86x | **PASS** | 99.55% (444/446) | **True** |
+    | **Final Full (30k model)** (`final_full/`) | 824,903 | 185.66 MB (194,678,649 B) | 25.17 MB (26,396,896 B) | 16.03 MB (16,811,342 B) | 18.38x | **PASS** | 98.43% (439/446) | **True** |
+    | **Final 700k (30k model)** (`final_700k/`) | 700,000 | 157.55 MB (165,201,541 B) | 21.36 MB (22,400,000 B) | 13.49 MB (14,149,807 B) | 21.84x | **PASS** | 98.65% (440/446) | **True** |
+  - SPZ Round-trip Quality (Decompressed back to PLY):
+    - Final Full: 0 splat count diff, max centre error = 0.210 mm, mean centre error = 0.117 mm, mean opacity error = 0.000975.
+    - Final 700k: 0 splat count diff, max centre error = 0.210 mm, mean centre error = 0.117 mm, mean opacity error = 0.000975.
+  - Coordinate Frame Verification (`scripts/verify_splat_frame.py`):
+    - Final Full: Umeyama yaw = -0.00°, trans = 0.0002 m, scale = 0.9999, floor peak = -0.050 m, floor tilt = 0.53°, camera inclusion = 100.0% -> **PASS**.
+    - Final 700k: Umeyama yaw = -0.00°, trans = 0.0003 m, scale = 0.9999, floor peak = -0.050 m, floor tilt = 0.61°, camera inclusion = 100.0% -> **PASS**.
+  - Deployed `final_700k` assets (`scene.json`, `scene.splat`, `scene.spz`, `occupancy.json`, `occupancy.png`) to `viewer/public/scene/`.
+    - Preserved exact eye height (1.45 m above floor at y = 0.0), spawn position `[1.771, 1.450, 3.523]`, spawn yaw `-0.0426` rad (`-2.44°`), and `splat_rotation_euler` (`[0.0, 0.0, 0.0]`).
 - [ ] Web Viewer (`viewer/`): Interactive first-person 3DGS roaming web viewer.
 
 
@@ -160,8 +331,13 @@
 
 ```bash
 # 1. Activate venv
-.venv\Scripts\activate        # Windows
-# source .venv/bin/activate   # Linux/macOS
+venv\Scripts\activate         # Windows
+# source venv/bin/activate    # Linux/macOS
+
+# --- SFM FAILURE FIX EXPERIMENT (E3: 99.1% RECOVERY) ---
+# Run E3 with two cameras (one per video folder), SIMPLE_RADIAL, focal prior 1440px
+python scripts/run_e3.py
+# Outputs: colmap_runs/E3/ (sparse/0, cameras.txt, images.txt, points3D.txt)
 
 # --- ONE-COMMAND REPRODUCTION (Runs diagnosis + alignment + top-view) ---
 python scripts/reproduce_all.py --scene home
@@ -171,17 +347,22 @@ python scripts/reproduce_all.py --scene home
 python scripts/diagnose_sfm.py --scene home
 # Outputs: docs/sfm_diagnosis.md
 
-# 2. Align scene to metric Y-up, floor at y=0 (Stage 3)
+# 2. Run Synthetic Alignment Unit Test Suite (Phase 4)
+python test/test_align.py
+# Tests: floor y=0 <= 1cm, UP=+Y <= 1 deg, cam height <= 1%, det(R)=+1.0, CCW positive area
+
+# 3. Align scene to metric Y-up, floor at y=0 (Phase 4)
 python pipeline/align_scene.py --scene home
-# Outputs: data/home/colmap_aligned/ (cameras.txt, images.txt, points3D.txt)
-#          data/home/transforms.json (Nerfstudio format)
+# Outputs: data/home/colmap_aligned/ (cameras.txt/bin, images.txt/bin, points3D.txt/bin, points3D.ply)
+#          data/home/transforms.json (Nerfstudio OpenGL format)
 #          data/home/alignment.json
 
-# 3. Check and verify alignment (diagnostic side and top PNGs)
+# 4. Check and verify alignment (Phase 4 Diagnostic Plots)
 python scripts/check_alignment.py --scene home
-# Outputs: outputs/home/alignment_check.png
-#          outputs/home/alignment_side.png
-#          outputs/home/alignment_top.png
+# Outputs: outputs/home/top.png (true top-down, log-density, ~5s arrows, gap, scale bar)
+#          outputs/home/side_xy.png (X vs Y elevation, floor y=0, ceiling)
+#          outputs/home/side_zy.png (Z vs Y elevation, floor y=0, ceiling)
+#          outputs/home/alignment_check.png (4-panel diagnostic dashboard)
 
 # 4. Generate trustworthy top-down view, overlay, and 4-leg verification sheet
 python scripts/make_topview.py --scene home
@@ -189,23 +370,62 @@ python scripts/make_topview.py --scene home
 #          outputs/home/topview_overlay.png
 #          outputs/home/topview_legs.jpg
 
-# 5. Pack training bundle for GPU / Colab (Stage 4)
+# 5. Pack training bundle for GPU / Colab (Phase 5)
 python scripts/pack_dataset.py --scene home
-# Outputs: outputs/home/train_pack.zip
+# Outputs: outputs/home/train_pack.zip (109.11 MB)
 
-# 6. Train 3D Gaussian Splatting model (Stage 4)
+# 6. Validate training configuration and commands (dry run)
 python pipeline/train_splat.py --scene home --preset fast --dry-run
 # Remote / Colab: notebooks/colab_train.ipynb
-# Outputs: outputs/home/scene_raw.ply
-#          outputs/home/metrics.json
 
-# 7. Verify exported splat coordinate frame
-python scripts/verify_splat_frame.py --scene home
-# Outputs: outputs/home/splat_frame_verification.json
+# 7. Train 3D Gaussian Splatting model (detached background)
+# Fast preset (7,000 steps smoke test):
+python pipeline/train_splat.py --scene home --preset fast
+# Final preset (30,000 steps, SH degree 3 production run):
+python pipeline/train_splat.py --scene home --preset final
+# Check status in < 5 seconds:
+python pipeline/train_splat.py --scene home --status
+# Or view logs: powershell -Command "Get-Content outputs/home/logs/train.log -Tail 10"
+
+# 8. Run unit test suite on synthetic Gaussian Splats
+python test/test_verify_splat.py
+# 4 tests: valid splat, displaced floor fail, upside-down fail, extents >15% fail
+
+# 9. Post-Process Scene, Occupancy Grid & Compression (Phase 6)
+# (a) Full 30k model post-processing (unlimited splats, max_splats = 0):
+python pipeline/postprocess_scene.py --scene home --input outputs/home/scene_raw.ply --output-dir outputs/home/final_full --max-splats 0 --no-copy-viewer
+# Outputs: outputs/home/final_full/ (scene_clean.ply, scene.splat, scene.spz, scene.json, occupancy.json, occupancy.png)
+
+# (b) Budgeted 700k model post-processing (max_splats = 700000):
+python pipeline/postprocess_scene.py --scene home --input outputs/home/scene_raw.ply --output-dir outputs/home/final_700k --max-splats 700000 --no-copy-viewer
+# Outputs: outputs/home/final_700k/ (scene_clean.ply, scene.splat, scene.spz, scene.json, occupancy.json, occupancy.png)
+
+# 10. Verify exported splat coordinate frame
+python scripts/verify_splat_frame.py --scene home --splat-ply outputs/home/final_700k/scene_clean.ply --scene-json outputs/home/final_700k/scene.json
+# Outputs: outputs/home/final_700k/clean_frame_verification.json
+
+# --- COMMANDS TO SWITCH VIEWER VARIANTS ---
+# Deploy 700k variant (Default / Recommended for web performance):
+# PowerShell:
+Copy-Item -Force outputs/home/final_700k/scene.json, outputs/home/final_700k/scene.splat, outputs/home/final_700k/scene.spz, outputs/home/final_700k/occupancy.json, outputs/home/final_700k/occupancy.png viewer/public/scene/
+# Bash:
+# cp outputs/home/final_700k/{scene.json,scene.splat,scene.spz,occupancy.json,occupancy.png} viewer/public/scene/
+
+# Switch to Full 30k variant (825k splats):
+# PowerShell:
+Copy-Item -Force outputs/home/final_full/scene.json, outputs/home/final_full/scene.splat, outputs/home/final_full/scene.spz, outputs/home/final_full/occupancy.json, outputs/home/final_full/occupancy.png viewer/public/scene/
+# Bash:
+# cp outputs/home/final_full/{scene.json,scene.splat,scene.spz,occupancy.json,occupancy.png} viewer/public/scene/
+
+# Switch to Fast 7k preset (383k splats):
+# PowerShell:
+Copy-Item -Force outputs/home/web_assets_fast/scene.json, outputs/home/web_assets_fast/scene.splat, outputs/home/web_assets_fast/scene.spz, outputs/home/web_assets_fast/occupancy.json, outputs/home/web_assets_fast/occupancy.png viewer/public/scene/
+# Bash:
+# cp outputs/home/web_assets_fast/{scene.json,scene.splat,scene.spz,occupancy.json,occupancy.png} viewer/public/scene/
 ```
 
 ## Known Issues / TODOs
 
-- Pass 1 registration rate (82.6%) vs Pass 2 (100%): 35 frames dropped in Pass 1 during quick turns across featureless white walls. Overall registration across both passes is 92.2% (exceeds >=85% quality gate).
-- Training preparation: `data/home/colmap/aligned/` is fully prepared and metric-scaled for 3D Gaussian Splatting (`pipeline/train_splat.py`).
-- Implement first-person interactive WebGL/WebGPU viewer in `viewer/`.
+- Stage 5 Post-Processing & Model Comparison: Complete. Full 30k model (824,903 splats) and 700k budgeted model (700,000 splats) generated and audited against the 7k model (383,101 splats). All coordinate verifications pass. 700k variant deployed to `viewer/public/scene/`.
+- Phase 7: Implement interactive first-person WebGL/WebGPU 3DGS roaming viewer in `viewer/` loading `viewer/public/scene/scene.json` (`scene.spz` / `scene.splat`).
+

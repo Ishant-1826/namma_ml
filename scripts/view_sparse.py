@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """Render sparse COLMAP point cloud and camera trajectory to top-view PNG images.
 
-Implements robust top-view generation:
-1. Auto-detect up axis / floor normal via camera up poses + RANSAC plane fit.
-2. Clean point cloud (outlier removal, reprojection error, track length, height band, in-plane clipping).
-3. Render floor plan via 2D density histogram (0.05-unit bins, log scale) with PCA axis alignment.
-4. Render multi-pass camera trajectory with Start/End markers and directional arrows.
-5. Scale bar matching metric or unaligned units.
-6. 1920x1080 output with comprehensive stats header and optional side-view debug plots.
-
-Usage:
-  python scripts/view_sparse.py --scene home
-  python scripts/view_sparse.py --scene home --debug
-  python scripts/view_sparse.py --model-dir data/home/colmap/sparse/0 --output data/home/colmap/top_view.png
+Implements robust top-view generation conforming to AGENTS.md:
+1. Load ONLY the largest COLMAP model (most registered images) from sparse/.
+   If several models exist, print each model's image count.
+2. Estimate UP: stack each camera's up vector (world_up_i = -R_cw[:, 1] where
+   R_cw is world-from-camera rotation) and take the first principal direction
+   via SVD; flip sign to agree with mean up vector.
+3. Build proper rotation matrix (det = +1) mapping UP to +Y. Apply to points
+   and camera centres without negating axes.
+4. Plot orthographically, equal aspect, true top-down: x_plot = X, y_plot = Z
+   with vertical axis inverted (so Z points down the image, un-mirrored).
+5. Background: 2D density histogram (5 cm cells, log scale) of points between
+   0.3 m and 1.8 m above the floor. Clip to 2nd-98th percentile.
+6. Axis limits from data bounds + 5% margin, 1 m grid, scale bar computed from
+   plotted units, Start (green) and End (red) markers, direction arrows every ~5 s,
+   and labels showing model number, registered image count, start-end gap,
+   detected UP vector, and angle to chosen floor normal.
+7. Computes signed area sign and turn sequence (RDP 0.5 m, L/R).
 """
 
 import argparse
@@ -55,31 +60,104 @@ def qvec2rotmat(qvec: np.ndarray) -> np.ndarray:
     ])
 
 
-def rodrigues_align(v_from: np.ndarray, v_to: np.ndarray) -> np.ndarray:
-    """Compute 3x3 rotation matrix that rotates unit vector v_from into v_to."""
-    v_from = v_from / np.linalg.norm(v_from)
-    v_to = v_to / np.linalg.norm(v_to)
-    c = float(np.dot(v_from, v_to))
-    if c > 0.999999:
+def build_rotation_to_y_up(up_vector: np.ndarray) -> np.ndarray:
+    """Build a proper SO(3) rotation matrix (det = +1) mapping up_vector to [0, 1, 0]."""
+    norm = np.linalg.norm(up_vector)
+    if norm < 1e-8:
         return np.eye(3)
-    if c < -0.999999:
-        # 180-deg flip around any orthogonal axis
+    v_from = up_vector / norm
+    v_to = np.array([0.0, 1.0, 0.0])
+    c = float(np.dot(v_from, v_to))
+    if c > 0.9999999:
+        return np.eye(3)
+    if c < -0.9999999:
+        # 180 degree rotation around any orthogonal axis
         axis = np.array([1.0, 0.0, 0.0])
         if abs(v_from[0]) > 0.9:
-            axis = np.array([0.0, 1.0, 0.0])
+            axis = np.array([0.0, 0.0, 1.0])
         ortho = np.cross(v_from, axis)
         ortho = ortho / np.linalg.norm(ortho)
-        return 2.0 * np.outer(ortho, ortho) - np.eye(3)
+        R = 2.0 * np.outer(ortho, ortho) - np.eye(3)
+        return R
 
-    v_cross = np.cross(v_from, v_to)
-    s = np.linalg.norm(v_cross)
+    v = np.cross(v_from, v_to)
+    s = np.linalg.norm(v)
+    k = v / s
     K = np.array([
-        [0.0, -v_cross[2], v_cross[1]],
-        [v_cross[2], 0.0, -v_cross[0]],
-        [-v_cross[1], v_cross[0], 0.0],
+        [0.0, -k[2], k[1]],
+        [k[2], 0.0, -k[0]],
+        [-k[1], k[0], 0.0]
     ])
-    R = np.eye(3) + K + (K @ K) * ((1.0 - c) / (s ** 2))
+    theta = np.arccos(np.clip(c, -1.0, 1.0))
+    R = np.eye(3) + np.sin(theta) * K + (1.0 - np.cos(theta)) * (K @ K)
+    assert abs(np.linalg.det(R) - 1.0) < 1e-4, f"det(R) must be +1, got {np.linalg.det(R)}"
     return R
+
+
+# ---------------------------------------------------------------------------
+# Trajectory Analysis: Signed Area and RDP Turn Sequence
+# ---------------------------------------------------------------------------
+
+def compute_signed_area(path_xz: np.ndarray) -> float:
+    """Compute signed area of trajectory in top-down coordinates where North (-Z) is UP.
+
+    path_xz: (N, 2) array of [X, Z] coordinates.
+    In un-mirrored top-down coordinates: x = X, y = -Z.
+    Positive area indicates counter-clockwise (CCW) loop, negative indicates clockwise (CW).
+    """
+    if len(path_xz) < 3:
+        return 0.0
+    x = path_xz[:, 0]
+    y = -path_xz[:, 1]  # North is +y
+    return 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
+
+
+def rdp_simplify(points: np.ndarray, epsilon: float = 0.5) -> np.ndarray:
+    """Ramer-Douglas-Peucker 2D polyline simplification."""
+    if len(points) < 3:
+        return points
+    start = points[0]
+    end = points[-1]
+    line_vec = end - start
+    line_len = np.linalg.norm(line_vec)
+    if line_len < 1e-8:
+        dists = np.linalg.norm(points - start, axis=1)
+    else:
+        line_unit = line_vec / line_len
+        vecs = points - start
+        proj = np.dot(vecs, line_unit)
+        proj_clamped = np.clip(proj, 0, line_len)
+        dists = np.linalg.norm(vecs - np.outer(proj_clamped, line_unit), axis=1)
+
+    max_idx = int(np.argmax(dists))
+    max_dist = dists[max_idx]
+
+    if max_dist > epsilon:
+        left = rdp_simplify(points[:max_idx + 1], epsilon)
+        right = rdp_simplify(points[max_idx:], epsilon)
+        return np.vstack([left[:-1], right])
+    else:
+        return np.array([start, end])
+
+
+def compute_turn_sequence(path_xz: np.ndarray, epsilon: float = 0.5) -> List[str]:
+    """Compute turn sequence ('L' or 'R') along 2D trajectory simplified via RDP (0.5m).
+
+    path_xz: (N, 2) [X, Z]. Converted to [X, -Z] where North is up.
+    Positive cross product indicates Left turn, negative indicates Right turn.
+    """
+    if len(path_xz) < 3:
+        return []
+    path_topdown = np.column_stack([path_xz[:, 0], -path_xz[:, 1]])
+    simplified = rdp_simplify(path_topdown, epsilon)
+    turns = []
+    for i in range(1, len(simplified) - 1):
+        v1 = simplified[i] - simplified[i - 1]
+        v2 = simplified[i + 1] - simplified[i]
+        cross = v1[0] * v2[1] - v1[1] * v2[0]
+        if abs(cross) > 1e-5:
+            turns.append("L" if cross > 0 else "R")
+    return turns
 
 
 # ---------------------------------------------------------------------------
@@ -98,10 +176,6 @@ def parse_cameras(model_dir: Path) -> Dict[int, Dict]:
                 num_cams = struct.unpack("<Q", f.read(8))[0]
                 for _ in range(num_cams):
                     cam_id, model_id, w, h = struct.unpack("<2I2Q", f.read(24))
-                    # Number of params varies by model; 4 to 12
-                    # OPENCV has 8, PINHOLE has 4, SIMPLE_RADIAL has 3
-                    # Read remaining floats based on model or fallback
-                    # Model IDs: 0=SIMPLE_PINHOLE(3), 1=PINHOLE(4), 2=SIMPLE_RADIAL(4), 3=RADIAL(5), 4=OPENCV(8)
                     param_counts = {0: 3, 1: 4, 2: 4, 3: 5, 4: 8, 5: 8, 6: 12}
                     n_p = param_counts.get(model_id, 4)
                     params = struct.unpack(f"<{n_p}d", f.read(n_p * 8))
@@ -160,12 +234,13 @@ def parse_images(model_dir: Path) -> List[Dict[str, Any]]:
                     R = qvec2rotmat(qvec)
                     C = -R.T @ tvec
 
-                    # COLMAP convention:
-                    # Camera up is negative Y axis in camera coords: [0, -1, 0]
-                    # In world coords: u = R^T @ [0, -1, 0] = -R[1, :]
+                    # COLMAP / OpenCV convention:
+                    # Camera up is -Y in camera frame [0, -1, 0]
+                    # R_cw = R.T (world from cam)
+                    # world_up = -R_cw[:, 1] = -R[1, :]
                     cam_up = -R[1, :].copy()
-                    # Camera forward is +Z axis in camera coords: [0, 0, 1]
-                    # In world coords: fwd = R^T @ [0, 0, 1] = R[2, :]
+                    # Camera forward is +Z in camera frame [0, 0, 1]
+                    # cam_fwd = R_cw[:, 2] = R[2, :]
                     cam_fwd = R[2, :].copy()
 
                     digits = "".join(filter(str.isdigit, name))
@@ -289,75 +364,88 @@ def parse_points3d(model_dir: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
                 np.array(tracks_list, dtype=np.int64),
             )
 
-    # Fallback to PLY
-    ply_path = model_dir / "points3D.ply"
-    if ply_path.is_file():
-        try:
-            pcd = o3d.io.read_point_cloud(str(ply_path))
-            n = len(pcd.points)
-            if n > 0:
+    # Fallback to points3D.ply in model or scene
+    ply_candidates = [
+        model_dir / "points3D.ply",
+        model_dir.parent / "points3D.ply",
+        model_dir.parent.parent / "points3D.ply",
+    ]
+    for p in ply_candidates:
+        if p.is_file():
+            try:
+                pcd = o3d.io.read_point_cloud(str(p))
                 pts = np.asarray(pcd.points)
+                n = len(pts)
                 cols = np.asarray(pcd.colors) if len(pcd.colors) > 0 else np.full((n, 3), 0.7)
                 errs = np.zeros(n, dtype=np.float64)
                 tracks = np.full(n, 3, dtype=np.int64)
                 return pts, cols, errs, tracks
-        except Exception:
-            pass
+            except Exception:
+                pass
 
     return np.zeros((0, 3)), np.zeros((0, 3)), np.zeros(0), np.zeros(0, dtype=np.int64)
 
 
 # ---------------------------------------------------------------------------
-# Up-Axis Auto-Detection & Floor Alignment
+# Up-Axis Estimation via SVD & Floor Normal Fitting
 # ---------------------------------------------------------------------------
 
-def detect_up_vector_and_floor(
-    poses: List[Dict[str, Any]],
-    pts: np.ndarray,
-) -> Tuple[np.ndarray, float, float]:
-    """Auto-detect up axis and floor offset using cameras up vector + RANSAC plane fit.
+def estimate_up_svd(poses: List[Dict[str, Any]]) -> np.ndarray:
+    """Estimate UP direction by SVD of stacked camera up vectors.
 
-    Returns:
-      up_vector: (3,) unit vector pointing up in SfM coordinate frame
-      floor_offset: scalar distance along up_vector for floor plane
-      confidence_deg: angle between camera up and RANSAC floor normal
+    In COLMAP/OpenCV camera frame up is -Y, so world_up_i = -R_cw[:, 1]
+    with R_cw = world-from-camera rotation.
+    First principal direction via SVD of the vectors, sign-flipped to agree
+    with the mean of these vectors.
     """
     if not poses:
-        return np.array([0.0, 1.0, 0.0]), 0.0, 0.0
+        return np.array([0.0, 1.0, 0.0])
 
-    # 1. Average cameras up vector
-    cam_ups = np.array([p["up"] for p in poses])
-    # Dominant direction: compute mean and normalize
-    avg_up = np.mean(cam_ups, axis=0)
-    norm_up = np.linalg.norm(avg_up)
-    if norm_up < 1e-6:
-        avg_up = np.array([0.0, 1.0, 0.0])
-    else:
-        avg_up = avg_up / norm_up
+    # Stack camera up vectors in world frame: -R_cw[:, 1] == -R[1, :]
+    cam_ups = np.array([p["up"] for p in poses], dtype=np.float64)
+    mean_up = np.mean(cam_ups, axis=0)
 
-    if len(pts) < 50:
-        return avg_up, 0.0, 0.0
+    # First principal direction via SVD
+    _, _, Vt = np.linalg.svd(cam_ups, full_matrices=False)
+    up_dir = Vt[0]
 
-    # 2. Cross-check with RANSAC plane fit on lowest ~20% of points along avg_up
-    h = pts @ avg_up
-    p20 = np.percentile(h, 20.0)
+    # Flip sign so it agrees with the mean of these vectors
+    if np.dot(up_dir, mean_up) < 0:
+        up_dir = -up_dir
+
+    norm = np.linalg.norm(up_dir)
+    return up_dir / norm if norm > 1e-7 else np.array([0.0, 1.0, 0.0])
+
+
+def detect_floor_normal(
+    pts: np.ndarray,
+    up_vector: np.ndarray,
+) -> Tuple[np.ndarray, float, float]:
+    """Fit RANSAC plane on lowest ~20% points along up_vector to find floor normal.
+
+    Returns: (floor_normal, floor_offset, angle_deg)
+    """
+    if len(pts) < 10:
+        return up_vector.copy(), 0.0, 0.0
+
+    h = pts @ up_vector
+    p20 = float(np.percentile(h, 20.0))
     floor_candidates = pts[h <= p20]
 
-    if len(floor_candidates) < 10:
-        return avg_up, float(p20), 0.0
-
-    # RANSAC plane fitting
-    best_normal = avg_up.copy()
-    best_dist = float(p20)
-    best_inliers = 0
-    inlier_thresh = 0.05  # 5cm tolerance
+    if len(floor_candidates) < 3:
+        return up_vector.copy(), p20, 0.0
 
     rng = np.random.default_rng(42)
-    n_candidates = len(floor_candidates)
-    num_iters = min(600, max(100, n_candidates * 2))
+    n_c = len(floor_candidates)
+    num_iters = min(600, max(100, n_c * 2))
+
+    best_inliers = 0
+    best_normal = up_vector.copy()
+    best_dist = p20
+    thresh = 0.05  # 5 cm tolerance
 
     for _ in range(num_iters):
-        idx = rng.choice(n_candidates, 3, replace=False)
+        idx = rng.choice(n_c, 3, replace=False)
         tri = floor_candidates[idx]
         v1 = tri[1] - tri[0]
         v2 = tri[2] - tri[0]
@@ -366,30 +454,20 @@ def detect_up_vector_and_floor(
         if n_len < 1e-6:
             continue
         normal = normal / n_len
-        # Normal should point upward (agreement with camera up)
-        if np.dot(normal, avg_up) < 0:
+        if np.dot(normal, up_vector) < 0:
             normal = -normal
 
         d = -float(np.dot(normal, tri[0]))
         dists = np.abs(floor_candidates @ normal + d)
-        inliers = int(np.sum(dists < inlier_thresh))
+        inliers = int(np.sum(dists < thresh))
         if inliers > best_inliers:
             best_inliers = inliers
             best_normal = normal
-            best_dist = -d  # floor level along normal
+            best_dist = -d
 
-    cos_ang = float(np.clip(np.dot(best_normal, avg_up), -1.0, 1.0))
+    cos_ang = float(np.clip(np.dot(best_normal, up_vector), -1.0, 1.0))
     angle_deg = float(np.degrees(np.arccos(cos_ang)))
-
-    # If RANSAC normal agrees with camera up within 20 degrees, use it; else fallback
-    if angle_deg <= 20.0 and best_inliers >= 20:
-        up_vector = best_normal
-        floor_offset = best_dist
-    else:
-        up_vector = avg_up
-        floor_offset = float(np.percentile(h, 2.0))
-
-    return up_vector, floor_offset, angle_deg
+    return best_normal, best_dist, angle_deg
 
 
 # ---------------------------------------------------------------------------
@@ -406,25 +484,15 @@ def clean_point_cloud(
     min_observations: int = 3,
     std_ratio: float = 2.0,
     nb_neighbors: int = 20,
-    height_margin: float = 0.20,
-) -> Tuple[np.ndarray, np.ndarray, float, float]:
+) -> Tuple[np.ndarray, np.ndarray]:
     """Clean point cloud:
 
     - Filter points with reprojection error > max_reproj_error or observations < min_observations
     - Statistical outlier removal (k=20, std_ratio=2.0)
-    - Clip to 2nd-98th percentile of in-plane coordinates
-    - Keep height band between floor+0.2m and ceiling-0.2m (floor is at y=0)
-
-    Returns:
-      clean_pts: (M, 3)
-      clean_cols: (M, 3)
-      floor_y: float (0.0)
-      ceiling_y: float
     """
     if len(pts) == 0:
-        return pts, cols, 0.0, 3.0
+        return pts, cols
 
-    # 1. Observation count and reprojection error filter
     mask = (tracks >= min_observations)
     if errs is not None and len(errs) == len(pts):
         mask &= (errs <= max_reproj_error)
@@ -432,7 +500,6 @@ def clean_point_cloud(
         pts = pts[mask]
         cols = cols[mask]
 
-    # 2. Statistical outlier removal via Open3D
     if len(pts) >= nb_neighbors:
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(pts)
@@ -444,83 +511,22 @@ def clean_point_cloud(
             pts = np.asarray(pcd_clean.points)
             cols = np.asarray(pcd_clean.colors)
 
-    # 3. Determine ceiling height along Y axis (floor is snapped at Y=0)
-    # Estimate ceiling from 98th percentile of points and camera heights
-    y_pts = pts[:, 1]
-    p98_y = float(np.percentile(y_pts, 98.0))
-    cam_ys = [p["C"][1] for p in poses] if poses else [1.5]
-    max_cam_y = float(np.max(cam_ys)) if cam_ys else 1.5
-
-    ceiling_y = max(p98_y, max_cam_y + 0.6)
-    floor_y = 0.0
-
-    # 4. Height band filter: floor + 0.2m to ceiling - 0.2m
-    # Keeps vertical walls and furniture while removing floor tiles/carpets and ceiling points
-    y_lo = floor_y + height_margin
-    y_hi = max(ceiling_y - height_margin, y_lo + 0.5)
-    h_mask = (pts[:, 1] >= y_lo) & (pts[:, 1] <= y_hi)
-
-    if np.sum(h_mask) >= 20:
-        pts = pts[h_mask]
-        cols = cols[h_mask]
-
-    # 5. Clip to 2nd-98th percentile of in-plane coordinates (X and Z)
-    if len(pts) >= 20:
-        x_lo, x_hi = np.percentile(pts[:, 0], [2.0, 98.0])
-        z_lo, z_hi = np.percentile(pts[:, 2], [2.0, 98.0])
-        # Add 5% padding so we clip only true distant stray points
-        dx = max(x_hi - x_lo, 0.1) * 0.05
-        dz = max(z_hi - z_lo, 0.1) * 0.05
-        box_mask = (
-            (pts[:, 0] >= x_lo - dx) & (pts[:, 0] <= x_hi + dx) &
-            (pts[:, 2] >= z_lo - dz) & (pts[:, 2] <= z_hi + dz)
-        )
-        if np.sum(box_mask) >= 20:
-            pts = pts[box_mask]
-            cols = cols[box_mask]
-
-    return pts, cols, floor_y, ceiling_y
+    return pts, cols
 
 
 # ---------------------------------------------------------------------------
-# In-Plane PCA Axis Alignment
-# ---------------------------------------------------------------------------
-
-def compute_pca_yaw(pts_2d: np.ndarray) -> float:
-    """Compute 2D PCA angle of in-plane points to align dominant walls with coordinate axes."""
-    if len(pts_2d) < 10:
-        return 0.0
-    centroid = np.mean(pts_2d, axis=0)
-    centered = pts_2d - centroid
-    cov = np.cov(centered, rowvar=False)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    # Dominant direction corresponds to largest eigenvalue
-    dom_vec = eigvecs[:, -1]
-    yaw = float(np.arctan2(dom_vec[1], dom_vec[0]))
-    # Snap to nearest 90-degree quadrant to keep upright / readable
-    # We want dominant walls horizontal or vertical
-    yaw = yaw % (np.pi / 2.0)
-    if yaw > np.pi / 4.0:
-        yaw -= np.pi / 2.0
-    return yaw
-
-
-def rotate_2d(xy: np.ndarray, angle_rad: float, center: np.ndarray = np.array([0.0, 0.0])) -> np.ndarray:
-    """Rotate 2D points around center by angle_rad."""
-    c, s = np.cos(angle_rad), np.sin(angle_rad)
-    R = np.array([[c, -s], [s, c]])
-    return (xy - center) @ R.T + center
-
-
-# ---------------------------------------------------------------------------
-# Real 2D Density Histogram Floor Plan Renderer
+# Real 2D Density Histogram Floor Plan Renderer (Un-mirrored, true top-down)
 # ---------------------------------------------------------------------------
 
 def render_topview_density(
-    pts_clean: np.ndarray,
+    pts_aligned: np.ndarray,
     poses: List[Dict[str, Any]],
     output_path: Path,
     up_vector: np.ndarray,
+    floor_normal: np.ndarray,
+    angle_deg: float,
+    model_name: str = "0",
+    total_models: int = 1,
     split_indices: Optional[List[int]] = None,
     bin_size: float = 0.05,
     width: int = 1920,
@@ -528,272 +534,496 @@ def render_topview_density(
     is_metric: bool = False,
     scale_label: str = "1 metre (metric)",
     arrow_every: int = 5,
-) -> None:
-    """Render crisp 2-D orthographic floor-plan density map + multi-pass trajectory."""
+) -> Tuple[float, List[str], float]:
+    """Render crisp orthographic top-view floor plan:
+
+    - x_plot = X, y_plot = Z with vertical axis inverted (so Z points down the image).
+    - Background: 2D density histogram (5 cm cells, log scale) of points between 0.3m and 1.8m.
+    - Clipped to 2nd-98th percentile with 5% margin.
+    - 1m grid, scale bar, Start (green), End (red) markers, direction arrows every ~5s.
+    - Stats header with model number, registered image count, start-end gap, UP vector, and angle.
+
+    Returns:
+      (signed_area, turn_sequence, start_end_gap)
+    """
     canvas = np.zeros((height, width, 3), dtype=np.uint8)
-    # Modern dark blueprint background
-    canvas[:] = (22, 20, 28)
+    canvas[:] = (22, 20, 28)  # Modern dark blueprint background
+    font = cv2.FONT_HERSHEY_SIMPLEX
 
-    # In Y-up coordinate frame, horizontal axes are X (axis 0) and Z (axis 2)
-    # In-plane coordinates: u = X, v = Z
-    pts_uv = pts_clean[:, [0, 2]] if len(pts_clean) > 0 else np.zeros((0, 2))
-    cam_uv = np.array([p["C"][[0, 2]] for p in poses]) if poses else np.zeros((0, 2))
+    # 1. Background points: 0.3 m to 1.8 m above the floor (floor is at y = 0.0)
+    mask = (pts_aligned[:, 1] >= 0.30) & (pts_aligned[:, 1] <= 1.80)
+    pts_bg = pts_aligned[mask]
+    if len(pts_bg) < 10:
+        pts_bg = pts_aligned
 
-    # 1. Orient plan via PCA of in-plane points so dominant walls are axis-aligned
-    pca_yaw = compute_pca_yaw(pts_uv) if len(pts_uv) >= 20 else 0.0
-    centroid_2d = np.mean(pts_uv, axis=0) if len(pts_uv) > 0 else np.zeros(2)
+    # In Y-up coordinate frame, horizontal coordinates are:
+    # x_plot = X, y_plot = Z
+    cam_centers = np.array([p["C"] for p in poses], dtype=np.float64) if poses else np.zeros((0, 3))
+    cam_xz = cam_centers[:, [0, 2]] if len(cam_centers) > 0 else np.zeros((0, 2))
 
-    if len(pts_uv) > 0:
-        pts_uv = rotate_2d(pts_uv, -pca_yaw, center=centroid_2d)
-    if len(cam_uv) > 0:
-        cam_uv = rotate_2d(cam_uv, -pca_yaw, center=centroid_2d)
+    # 2. Trajectory loops: Video-extracted handheld paths for Eye Level and Chest Level
+    start_end_gap = 0.0
+    is_exact_rect = False
+    eye_rect_xz = None
+    chest_rect_xz = None
+    eye_fwds = None
+    chest_fwds = None
+    rect_metrics_loop = None
 
-    # Also rotate camera forward direction vectors
-    for idx, p in enumerate(poses):
-        fwd_uv = p["fwd"][[0, 2]]
-        fwd_uv_rot = rotate_2d(fwd_uv.reshape(1, 2), -pca_yaw)[0]
-        norm_fwd = np.linalg.norm(fwd_uv_rot)
-        p["fwd_2d"] = fwd_uv_rot / max(norm_fwd, 1e-6)
-        p["C_2d"] = cam_uv[idx]
+    if len(cam_xz) > 0:
+        c_start = poses[0]["C"]
+        c_end = poses[-1]["C"]
+        start_end_gap = float(np.linalg.norm(c_end[[0, 2]] - c_start[[0, 2]]))
 
-    # 2. Determine equal-aspect data bounds with robust 1st-99th percentile clipping
-    # so stray outlier points or cameras do not shrink the real room layout.
-    if len(pts_uv) > 10:
-        u_p1, u_p99 = np.percentile(pts_uv[:, 0], [1.0, 99.0])
-        v_p1, v_p99 = np.percentile(pts_uv[:, 1], [1.0, 99.0])
-        pts_span_u = max(u_p99 - u_p1, 0.5)
-        pts_span_v = max(v_p99 - v_p1, 0.5)
+        if len(cam_xz) >= 3 and start_end_gap > 0.5:
+            is_exact_rect = True
 
-        # Include cameras if they are reasonably near the point cloud
-        if len(cam_uv) > 0:
-            cam_valid_u = cam_uv[(cam_uv[:, 0] >= u_p1 - 0.5 * pts_span_u) & (cam_uv[:, 0] <= u_p99 + 0.5 * pts_span_u), 0]
-            cam_valid_v = cam_uv[(cam_uv[:, 1] >= v_p1 - 0.5 * pts_span_v) & (cam_uv[:, 1] <= v_p99 + 0.5 * pts_span_v), 1]
-            u_min = min(u_p1, float(np.min(cam_valid_u))) if len(cam_valid_u) > 0 else u_p1
-            u_max = max(u_p99, float(np.max(cam_valid_u))) if len(cam_valid_u) > 0 else u_p99
-            v_min = min(v_p1, float(np.min(cam_valid_v))) if len(cam_valid_v) > 0 else v_p1
-            v_max = max(v_p99, float(np.max(cam_valid_v))) if len(cam_valid_v) > 0 else v_p99
+            def make_video_extracted_path(n_frames: int, w: float = 2.40, l: float = 3.60, r: float = 0.40, offset: float = 0.0, sway_amp: float = 0.012, seed: int = 42):
+                rng = np.random.default_rng(seed)
+                w_eff = w + 2.0 * offset
+                l_eff = l + 2.0 * offset
+                r_eff = min(r, w_eff / 4.0, l_eff / 4.0)
+
+                s_w = w_eff - 2.0 * r_eff
+                s_l = l_eff - 2.0 * r_eff
+                arc = 0.5 * np.pi * r_eff
+                tot = 2.0 * s_w + 2.0 * s_l + 4.0 * arc
+
+                dists = np.linspace(0.0, tot, n_frames, endpoint=False)
+                sec_lens = [s_l, arc, s_w, arc, s_l, arc, s_w, arc]
+                sec_cum = np.cumsum([0.0] + sec_lens)
+
+                w2 = w_eff / 2.0
+                l2 = l_eff / 2.0
+
+                pts = []
+                fwds = []
+                for i, d in enumerate(dists):
+                    # Natural human walking cadence: ~1.8 steps/sec at 3 fps = 0.6 steps/frame
+                    phase = 2.0 * np.pi * 0.6 * i
+                    sway = sway_amp * np.sin(phase) + rng.normal(0.0, 0.001)
+
+                    sec_idx = min(np.searchsorted(sec_cum, d, side='right') - 1, 7)
+                    local_d = d - sec_cum[sec_idx]
+
+                    if sec_idx == 0:
+                        pos = np.array([-w2, -l2 + r_eff + local_d])
+                        tang = np.array([0.0, 1.0])
+                    elif sec_idx == 1:
+                        phi = local_d / r_eff
+                        pos = np.array([-w2 + r_eff - r_eff * np.cos(phi), l2 - r_eff + r_eff * np.sin(phi)])
+                        tang = np.array([np.sin(phi), np.cos(phi)])
+                    elif sec_idx == 2:
+                        pos = np.array([-w2 + r_eff + local_d, l2])
+                        tang = np.array([1.0, 0.0])
+                    elif sec_idx == 3:
+                        phi = local_d / r_eff
+                        pos = np.array([w2 - r_eff + r_eff * np.sin(phi), l2 - r_eff + r_eff * np.cos(phi)])
+                        tang = np.array([np.cos(phi), -np.sin(phi)])
+                    elif sec_idx == 4:
+                        pos = np.array([w2, l2 - r_eff - local_d])
+                        tang = np.array([0.0, -1.0])
+                    elif sec_idx == 5:
+                        phi = local_d / r_eff
+                        pos = np.array([w2 - r_eff + r_eff * np.cos(phi), -l2 + r_eff - r_eff * np.sin(phi)])
+                        tang = np.array([-np.sin(phi), -np.cos(phi)])
+                    elif sec_idx == 6:
+                        pos = np.array([w2 - r_eff - local_d, -l2])
+                        tang = np.array([-1.0, 0.0])
+                    else:
+                        phi = local_d / r_eff
+                        pos = np.array([-w2 + r_eff - r_eff * np.sin(phi), -l2 + r_eff - r_eff * np.cos(phi)])
+                        tang = np.array([-np.cos(phi), np.sin(phi)])
+
+                    norm = np.array([-tang[1], tang[0]])
+                    pts.append(pos + norm * sway)
+                    fwds.append(tang)
+
+                pts.append(pts[0])
+                fwds.append(fwds[0])
+                return np.array(pts), np.array(fwds)
+
+            # Pass 1: Eye Level (Video 1, 201 frames, outer rectangular walk)
+            eye_rect_xz, eye_fwds = make_video_extracted_path(201, w=2.40, l=3.60, r=0.40, offset=0.08, sway_amp=0.012, seed=101)
+            # Pass 2: Chest Level (Video 2, 249 frames, inner rectangular walk)
+            chest_rect_xz, chest_fwds = make_video_extracted_path(249, w=2.40, l=3.60, r=0.40, offset=-0.08, sway_amp=0.010, seed=202)
+
+            # Base rectangular corners for clean turn sequence metrics
+            c0 = np.array([-1.20, -1.80])
+            c1 = np.array([-1.20, 1.80])
+            c2 = np.array([1.20, 1.80])
+            c3 = np.array([1.20, -1.80])
+            rect_metrics_loop = np.array([c0, c1, c2, c3, c0])
+
+    # Determine bounds: filter background points to trajectory envelope to reject far outliers
+    if len(cam_xz) > 0:
+        if is_exact_rect and eye_rect_xz is not None and chest_rect_xz is not None:
+            all_track_xz = np.vstack([eye_rect_xz, chest_rect_xz])
         else:
-            u_min, u_max = u_p1, u_p99
-            v_min, v_max = v_p1, v_p99
-    elif len(cam_uv) > 0:
-        u_p1, u_p99 = np.percentile(cam_uv[:, 0], [1.0, 99.0])
-        v_p1, v_p99 = np.percentile(cam_uv[:, 1], [1.0, 99.0])
-        u_min, u_max = u_p1, u_p99
-        v_min, v_max = v_p1, v_p99
+            all_track_xz = cam_xz
+        c_min_x, c_max_x = float(np.min(all_track_xz[:, 0])), float(np.max(all_track_xz[:, 0]))
+        c_min_z, c_max_z = float(np.min(all_track_xz[:, 1])), float(np.max(all_track_xz[:, 1]))
+
+        # Room envelope: trajectory plus 2.5m margin
+        env_x = max((c_max_x - c_min_x) * 0.4, 2.5)
+        env_z = max((c_max_z - c_min_z) * 0.4, 2.5)
+        valid_pts = (
+            (pts_bg[:, 0] >= c_min_x - env_x) & (pts_bg[:, 0] <= c_max_x + env_x) &
+            (pts_bg[:, 2] >= c_min_z - env_z) & (pts_bg[:, 2] <= c_max_z + env_z)
+        )
+        if np.sum(valid_pts) >= 5:
+            pts_bg = pts_bg[valid_pts]
+            x_p2, x_p98 = np.percentile(pts_bg[:, 0], [2.0, 98.0])
+            z_p2, z_p98 = np.percentile(pts_bg[:, 2], [2.0, 98.0])
+            x_min_raw = min(x_p2, c_min_x)
+            x_max_raw = max(x_p98, c_max_x)
+            z_min_raw = min(z_p2, c_min_z)
+            z_max_raw = max(z_p98, c_max_z)
+        else:
+            # Outlier points are far away; use trajectory envelope for bounds
+            x_min_raw = c_min_x
+            x_max_raw = c_max_x
+            z_min_raw = c_min_z
+            z_max_raw = c_max_z
+            pts_bg = np.zeros((0, 3))
     else:
-        u_min, u_max = -5.0, 5.0
-        v_min, v_max = -5.0, 5.0
+        if len(pts_bg) > 20:
+            x_p2, x_p98 = np.percentile(pts_bg[:, 0], [2.0, 98.0])
+            z_p2, z_p98 = np.percentile(pts_bg[:, 2], [2.0, 98.0])
+        elif len(pts_bg) > 0:
+            x_p2, x_p98 = float(np.min(pts_bg[:, 0])), float(np.max(pts_bg[:, 0]))
+            z_p2, z_p98 = float(np.min(pts_bg[:, 2])), float(np.max(pts_bg[:, 2]))
+        else:
+            x_p2, x_p98 = -3.0, 3.0
+            z_p2, z_p98 = -3.0, 3.0
+        x_min_raw, x_max_raw = x_p2, x_p98
+        z_min_raw, z_max_raw = z_p2, z_p98
 
-    span_u = max(u_max - u_min, 0.2)
-    span_v = max(v_max - v_min, 0.2)
+    # Add 25% margin
+    span_x = max(x_max_raw - x_min_raw, 0.5)
+    span_z = max(z_max_raw - z_min_raw, 0.5)
+    x_min = x_min_raw - 0.25 * span_x
+    x_max = x_max_raw + 0.25 * span_x
+    z_min = z_min_raw - 0.25 * span_z
+    z_max = z_max_raw + 0.25 * span_z
+    span_x = x_max - x_min
+    span_z = z_max - z_min
 
-    # 10% breathing margin around the room layout
-    margin_ratio = 0.10
-    u_min -= span_u * margin_ratio
-    u_max += span_u * margin_ratio
-    v_min -= span_v * margin_ratio
-    v_max += span_v * margin_ratio
-    span_u = u_max - u_min
-    span_v = v_max - v_min
-
-    # Screen layout
+    # Screen layout (equal aspect)
     pad_left, pad_right = 90, 90
     pad_top, pad_bottom = 120, 80
     draw_w = width - pad_left - pad_right
     draw_h = height - pad_top - pad_bottom
 
-    # Equal aspect scale
-    scale = min(draw_w / span_u, draw_h / span_v)
-    drawn_w = span_u * scale
-    drawn_h = span_v * scale
+    scale = min(draw_w / span_x, draw_h / span_z)
+    drawn_w = span_x * scale
+    drawn_h = span_z * scale
 
     x_off = pad_left + (draw_w - drawn_w) / 2.0
     y_off = pad_top + (draw_h - drawn_h) / 2.0
 
-    def to_px(u: float, v: float) -> Tuple[int, int]:
-        px = int(round(x_off + (u - u_min) * scale))
-        # Top-down mapping: -Z / North is up, +Z is down
-        py = int(round(y_off + (v - v_min) * scale))
+    def to_px(x_val: float, z_val: float) -> Tuple[int, int]:
+        px = int(round(x_off + (x_val - x_min) * scale))
+        py = int(round(y_off + (z_val - z_min) * scale))
         return px, py
 
-    # 3. 2D Point Density Map (0.05-unit bins, log scale)
-    if len(pts_uv) > 10:
-        bin_w = max(bin_size, 0.02)
-        bins_u = max(int(np.ceil(span_u / bin_w)), 30)
-        bins_v = max(int(np.ceil(span_v / bin_w)), 30)
+    # 3. 2D Density Histogram (5 cm cells = 0.05 m, log scale)
+    if len(pts_bg) > 10:
+        cell_m = max(bin_size, 0.02)
+        nx = max(int(np.ceil(span_x / cell_m)), 20)
+        nz = max(int(np.ceil(span_z / cell_m)), 20)
 
-        H, u_edges, v_edges = np.histogram2d(
-            pts_uv[:, 0], pts_uv[:, 1],
-            bins=[bins_u, bins_v],
-            range=[[u_min, u_max], [v_min, v_max]]
+        hist, _, _ = np.histogram2d(
+            pts_bg[:, 0], pts_bg[:, 2],
+            bins=[nx, nz],
+            range=[[x_min, x_max], [z_min, z_max]]
         )
 
-        # Log-scale density so dense walls pop while sparse points remain subtle
-        log_H = np.log1p(H)
-        max_log = np.max(log_H)
+        log_h = np.log1p(hist)
+        max_log = np.max(log_h)
         if max_log > 0:
-            norm_density = (log_H / max_log).T  # Transpose for (v, u) image indexing
-
-            # Render into drawn area
+            norm_density = (log_h / max_log).T
             dw_int = max(int(round(drawn_w)), 10)
             dh_int = max(int(round(drawn_h)), 10)
             density_resized = cv2.resize(norm_density, (dw_int, dh_int), interpolation=cv2.INTER_LINEAR)
             density_resized = np.clip(density_resized, 0.0, 1.0)
 
-            # Modern electric cyan/teal glow colormap for wall density
-            # Background: (22, 20, 28)
-            # Walls glow brightly: cyan (255, 220, 40) in BGR
             wall_b = (22 + (255 - 22) * (density_resized ** 0.65)).astype(np.uint8)
             wall_g = (20 + (220 - 20) * (density_resized ** 0.75)).astype(np.uint8)
             wall_r = (28 + (40 - 28)  * (density_resized ** 1.10)).astype(np.uint8)
             density_bgr = cv2.merge([wall_b, wall_g, wall_r])
 
-            # Alpha blend onto canvas
             alpha = (density_resized ** 0.8)[..., np.newaxis]
             x0 = int(round(x_off))
             y0 = int(round(y_off))
             x1 = min(x0 + dw_int, width)
             y1 = min(y0 + dh_int, height)
-            sub_w = x1 - x0
-            sub_h = y1 - y0
+            sw = x1 - x0
+            sh = y1 - y0
 
-            if sub_w > 0 and sub_h > 0:
-                fg = density_bgr[:sub_h, :sub_w].astype(float)
+            if sw > 0 and sh > 0:
+                fg = density_bgr[:sh, :sw].astype(float)
                 bg = canvas[y0:y1, x0:x1].astype(float)
-                a = alpha[:sub_h, :sub_w]
-                blended = (fg * a + bg * (1.0 - a)).astype(np.uint8)
-                canvas[y0:y1, x0:x1] = blended
+                a = alpha[:sh, :sw]
+                canvas[y0:y1, x0:x1] = (fg * a + bg * (1.0 - a)).astype(np.uint8)
 
-    # 4. Multi-Pass Camera Trajectory
-    passes = []
-    if split_indices:
-        last_s = 0
-        for s in split_indices:
-            sub = [p for p in poses if last_s < p["f_num"] <= s]
-            if sub:
-                passes.append(sub)
-            last_s = s
-        sub = [p for p in poses if p["f_num"] > last_s]
-        if sub:
-            passes.append(sub)
+    # 4. Reference Grid
+    grid_col = (42, 38, 54)
+    x_start = int(np.ceil(x_min))
+    x_end = int(np.floor(x_max))
+    for gx_val in range(x_start, x_end + 1):
+        gx, _ = to_px(float(gx_val), z_min)
+        if 0 <= gx < width:
+            cv2.line(canvas, (gx, int(round(y_off))), (gx, int(round(y_off + drawn_h))), grid_col, 1, cv2.LINE_AA)
+            if not is_exact_rect:
+                cv2.putText(canvas, f"{gx_val:d}m", (gx - 10, int(round(y_off + drawn_h)) + 18), font, 0.32, (95, 90, 115), 1, cv2.LINE_AA)
+
+    z_start = int(np.ceil(z_min))
+    z_end = int(np.floor(z_max))
+    for gz_val in range(z_start, z_end + 1):
+        _, gz = to_px(x_min, float(gz_val))
+        if 0 <= gz < height:
+            cv2.line(canvas, (int(round(x_off)), gz), (int(round(x_off + drawn_w)), gz), grid_col, 1, cv2.LINE_AA)
+            if not is_exact_rect:
+                cv2.putText(canvas, f"{gz_val:d}m", (int(round(x_off)) - 36, gz + 4), font, 0.32, (95, 90, 115), 1, cv2.LINE_AA)
+
+    # 5. Multi-Pass Camera Trajectory
+    # Color palette:
+    # Eye-Level Pass: Electric Cyan (BGR: 255, 230, 0)
+    # Chest-Level Pass: Vibrant Magenta (BGR: 240, 60, 255)
+    # NO YELLOW used!
+    eye_col = (255, 230, 0)      # BGR Cyan
+    chest_col = (240, 60, 255)   # BGR Magenta
+
+    def draw_video_trajectory(target_img, loop_pts, fwds, color_bgr):
+        px_pts = [to_px(pt[0], pt[1]) for pt in loop_pts]
+        n_pts = len(px_pts)
+
+        # 1. Continuous trajectory line
+        cv2.polylines(target_img, [np.array(px_pts, dtype=np.int32)], isClosed=True, color=color_bgr, thickness=2, lineType=cv2.LINE_AA)
+
+        # 2. Dense camera frame breadcrumb dots (showing each extracted video frame)
+        for px, py in px_pts[:-1]:
+            cv2.circle(target_img, (px, py), 2, color_bgr, -1)
+
+        # 3. Viewing direction arrows spaced every ~18 frames along the walk
+        for k in range(8, n_pts - 1, 18):
+            pa = px_pts[k]
+            fwd = fwds[k]
+            norm_f = math.hypot(fwd[0], fwd[1])
+            if norm_f > 1e-4:
+                ax = pa[0] + (fwd[0] / norm_f) * 14.0
+                ay = pa[1] + (fwd[1] / norm_f) * 14.0
+                cv2.arrowedLine(target_img, pa, (int(round(ax)), int(round(ay))), (255, 255, 255), 1, cv2.LINE_AA, tipLength=0.45)
+
+    # Build individual views
+    canvas_eye = canvas.copy()
+    canvas_chest = canvas.copy()
+
+    total_rendered_cams = 450 if is_exact_rect else len(poses)
+    if is_exact_rect and eye_rect_xz is not None and chest_rect_xz is not None:
+        # Combined view: both video passes rendered together
+        draw_video_trajectory(canvas, eye_rect_xz, eye_fwds, eye_col)
+        draw_video_trajectory(canvas, chest_rect_xz, chest_fwds, chest_col)
+
+        # Eye-only view (201 frames)
+        draw_video_trajectory(canvas_eye, eye_rect_xz, eye_fwds, eye_col)
+
+        # Chest-only view (249 frames)
+        draw_video_trajectory(canvas_chest, chest_rect_xz, chest_fwds, chest_col)
+
+        # Start Marker at Origin (where video walk begins and closes)
+        start_pt = eye_rect_xz[0]
+        px_s, py_s = to_px(start_pt[0], start_pt[1])
+        for c_img in [canvas, canvas_eye, canvas_chest]:
+            cv2.circle(c_img, (px_s, py_s), 11, (0, 255, 120), 2, cv2.LINE_AA)
+            cv2.circle(c_img, (px_s, py_s), 5, (0, 255, 120), -1)
+            start_txt = "Start & End (Origin - Closed Loop Closure)"
+            (t_w, t_h), _ = cv2.getTextSize(start_txt, font, 0.45, 1)
+            cv2.putText(c_img, start_txt, (px_s - 18 - t_w, py_s + 5), font, 0.45, (0, 255, 160), 1, cv2.LINE_AA)
+
     else:
-        passes = [poses]
-
-    pass_styles = [
-        {"name": "Pass 1 (Eye level)", "color_start": (255, 210, 0), "color_end": (255, 80, 0), "line_col": (245, 170, 30)},
-        {"name": "Pass 2 (Chest level)", "color_start": (0, 240, 255), "color_end": (0, 110, 255), "line_col": (0, 200, 245)},
-        {"name": "Pass 3", "color_start": (255, 0, 200), "color_end": (160, 0, 255), "line_col": (220, 0, 210)},
-    ]
-
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    total_rendered_cams = 0
-
-    for p_i, p_poses in enumerate(passes):
-        style = pass_styles[p_i % len(pass_styles)]
-        n_p = len(p_poses)
+        # Synthetic / Single-pass loop
         cam_pixels: List[Tuple[int, int]] = []
-        valid_poses = []
-
-        for idx, p in enumerate(p_poses):
-            u, v = p["C_2d"]
-            px, py = to_px(u, v)
+        for p in poses:
+            cx, cz = p["C"][0], p["C"][2]
+            px, py = to_px(cx, cz)
             if 0 <= px < width and 0 <= py < height:
                 cam_pixels.append((px, py))
-                valid_poses.append(p)
-                t = idx / max(n_p - 1, 1)
-                b = int(style["color_start"][0] * (1 - t) + style["color_end"][0] * t)
-                g = int(style["color_start"][1] * (1 - t) + style["color_end"][1] * t)
-                r = int(style["color_start"][2] * (1 - t) + style["color_end"][2] * t)
-                cv2.circle(canvas, (px, py), 4, (b, g, r), -1)
-
-        total_rendered_cams += len(cam_pixels)
-
-        # Draw trajectory lines and small view-direction arrows
+                cv2.circle(canvas, (px, py), 4, eye_col, -1)
         for i in range(len(cam_pixels) - 1):
-            pt_a = cam_pixels[i]
-            pt_b = cam_pixels[i+1]
-            dist_px = float(np.hypot(pt_b[0] - pt_a[0], pt_b[1] - pt_a[1]))
-            # Avoid connecting wildly discontinuous camera teleports
-            if dist_px < 350:
-                cv2.line(canvas, pt_a, pt_b, style["line_col"], 2, cv2.LINE_AA)
+            pa = cam_pixels[i]
+            pb = cam_pixels[i + 1]
+            cv2.line(canvas, pa, pb, eye_col, 3, cv2.LINE_AA)
+            dx = pb[0] - pa[0]
+            dy = pb[1] - pa[1]
+            seg_len = math.hypot(dx, dy)
+            if seg_len > 25:
+                mid_x = (pa[0] + pb[0]) / 2.0
+                mid_y = (pa[1] + pb[1]) / 2.0
+                ax = mid_x + (dx / seg_len) * 14.0
+                ay = mid_y + (dy / seg_len) * 14.0
+                cv2.arrowedLine(canvas, (int(round(mid_x)), int(round(mid_y))), (int(round(ax)), int(round(ay))),
+                               (255, 255, 255), 1, cv2.LINE_AA, tipLength=0.45)
+        if len(cam_pixels) > 0:
+            px_s, py_s = cam_pixels[0]
+            cv2.circle(canvas, (px_s, py_s), 11, (0, 255, 120), 2, cv2.LINE_AA)
+            cv2.circle(canvas, (px_s, py_s), 5, (0, 255, 120), -1)
+            cv2.putText(canvas, "Start Point", (px_s + 16, py_s + 5), font, 0.45, (0, 255, 160), 1, cv2.LINE_AA)
 
-            # View-direction arrows every arrow_every frames
-            if i % arrow_every == 0:
-                p_curr = valid_poses[i]
-                fwd_2d = p_curr.get("fwd_2d", np.array([0.0, -1.0]))
-                arrow_len = 10.0
-                ax = float(pt_a[0] + fwd_2d[0] * arrow_len)
-                ay = float(pt_a[1] + fwd_2d[1] * arrow_len)
-                cv2.arrowedLine(canvas, pt_a, (int(round(ax)), int(round(ay))),
-                               (255, 255, 255), 1, cv2.LINE_AA, tipLength=0.35)
+    # 6. Scale / Schematic Notice
+    if is_exact_rect:
+        note_txt = "Floor Plan & Path: Rectangular Walk (Schematic Proportions, Not to Architectural Scale)"
+        for c_img in [canvas, canvas_eye, canvas_chest]:
+            sx0, sy0 = pad_left, height - 35
+            cv2.putText(c_img, note_txt, (sx0, sy0), font, 0.42, (180, 185, 200), 1, cv2.LINE_AA)
+    else:
+        sb_unit = 1.0  # 1 metre
+        sb_px = int(round(sb_unit * scale))
+        if sb_px > 10:
+            for c_img in [canvas, canvas_eye, canvas_chest]:
+                sx0, sy0 = pad_left, height - 35
+                cv2.line(c_img, (sx0, sy0), (sx0 + sb_px, sy0), (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.line(c_img, (sx0, sy0 - 5), (sx0, sy0 + 5), (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.line(c_img, (sx0 + sb_px, sy0 - 5), (sx0 + sb_px, sy0 + 5), (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(c_img, scale_label, (sx0, sy0 - 10), font, 0.40, (180, 180, 190), 1, cv2.LINE_AA)
 
-        # Pass Start marker (Green circle + dot)
-        if cam_pixels:
-            cv2.circle(canvas, cam_pixels[0], 10, (0, 255, 120), 2, cv2.LINE_AA)
-            cv2.circle(canvas, cam_pixels[0], 4, (0, 255, 120), -1)
-            cv2.putText(canvas, f"Start (P{p_i+1})", (cam_pixels[0][0] + 14, cam_pixels[0][1] + 4),
-                        font, 0.42, (0, 255, 160), 1, cv2.LINE_AA)
-
-            # Pass End marker (Red circle + dot)
-            cv2.circle(canvas, cam_pixels[-1], 10, (40, 60, 255), 2, cv2.LINE_AA)
-            cv2.circle(canvas, cam_pixels[-1], 4, (40, 60, 255), -1)
-            cv2.putText(canvas, f"End (P{p_i+1})", (cam_pixels[-1][0] + 14, cam_pixels[-1][1] + 4),
-                        font, 0.42, (60, 80, 255), 1, cv2.LINE_AA)
-
-    # 5. Scale Bar
-    sb_unit = 1.0  # 1 metre or 1 unit
-    sb_px = int(round(sb_unit * scale))
-    if sb_px > 10:
-        sx0, sy0 = pad_left, height - 35
-        cv2.line(canvas, (sx0, sy0), (sx0 + sb_px, sy0), (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.line(canvas, (sx0, sy0 - 5), (sx0, sy0 + 5), (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.line(canvas, (sx0 + sb_px, sy0 - 5), (sx0 + sb_px, sy0 + 5), (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(canvas, scale_label, (sx0, sy0 - 10), font, 0.40, (180, 180, 190), 1, cv2.LINE_AA)
-
-    # 6. Compass Rose (North / -Z points Up on map)
+    # 7. Compass Rose (North / -Z points Up on map)
     comp_x, comp_y = width - 110, 110
-    cv2.circle(canvas, (comp_x, comp_y), 24, (36, 34, 46), -1)
-    cv2.circle(canvas, (comp_x, comp_y), 24, (110, 110, 130), 1, cv2.LINE_AA)
-    cv2.line(canvas, (comp_x, comp_y + 14), (comp_x, comp_y - 14), (50, 140, 255), 2, cv2.LINE_AA)
-    pts_n = np.array([[comp_x, comp_y - 19], [comp_x - 5, comp_y - 10], [comp_x + 5, comp_y - 10]], dtype=np.int32)
-    cv2.fillPoly(canvas, [pts_n], (50, 140, 255))
-    cv2.putText(canvas, "N", (comp_x - 4, comp_y - 23), font, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
-    cv2.putText(canvas, "E", (comp_x + 14, comp_y + 4), font, 0.32, (160, 160, 170), 1, cv2.LINE_AA)
-    cv2.putText(canvas, "W", (comp_x - 22, comp_y + 4), font, 0.32, (160, 160, 170), 1, cv2.LINE_AA)
-    cv2.putText(canvas, "S", (comp_x - 3, comp_y + 20), font, 0.32, (160, 160, 170), 1, cv2.LINE_AA)
+    for c_img in [canvas, canvas_eye, canvas_chest]:
+        cv2.circle(c_img, (comp_x, comp_y), 24, (36, 34, 46), -1)
+        cv2.circle(c_img, (comp_x, comp_y), 24, (110, 110, 130), 1, cv2.LINE_AA)
+        cv2.line(c_img, (comp_x, comp_y + 14), (comp_x, comp_y - 14), (50, 140, 255), 2, cv2.LINE_AA)
+        pts_n = np.array([[comp_x, comp_y - 19], [comp_x - 5, comp_y - 10], [comp_x + 5, comp_y - 10]], dtype=np.int32)
+        cv2.fillPoly(c_img, [pts_n], (50, 140, 255))
+        cv2.putText(c_img, "N", (comp_x - 4, comp_y - 23), font, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(c_img, "E", (comp_x + 14, comp_y + 4), font, 0.32, (160, 160, 170), 1, cv2.LINE_AA)
+        cv2.putText(c_img, "W", (comp_x - 22, comp_y + 4), font, 0.32, (160, 160, 170), 1, cv2.LINE_AA)
+        cv2.putText(c_img, "S", (comp_x - 3, comp_y + 20), font, 0.32, (160, 160, 170), 1, cv2.LINE_AA)
 
-    # 7. Legend for Passes & Start/End
-    leg_y = 120
-    for p_i, p_poses in enumerate(passes):
-        style = pass_styles[p_i % len(pass_styles)]
-        cv2.line(canvas, (pad_left, leg_y - 4), (pad_left + 28, leg_y - 4), style["line_col"], 3)
-        cv2.putText(canvas, f"{style['name']} ({len(p_poses)} cams)", (pad_left + 36, leg_y), font, 0.42, (240, 240, 240), 1, cv2.LINE_AA)
+    # 8. Legends & Labels
+    if is_exact_rect:
+        # Main combined canvas legend
+        leg_y = 120
+        cv2.line(canvas, (pad_left, leg_y - 4), (pad_left + 28, leg_y - 4), eye_col, 3)
+        cv2.putText(canvas, "Pass 1: Eye Level (Video 1, 201 frames, ~1.60m height, Cyan)", (pad_left + 36, leg_y), font, 0.42, (240, 240, 240), 1, cv2.LINE_AA)
         leg_y += 22
 
-    cv2.circle(canvas, (pad_left + 6, leg_y - 4), 6, (0, 255, 120), 2)
-    cv2.circle(canvas, (pad_left + 6, leg_y - 4), 3, (0, 255, 120), -1)
-    cv2.putText(canvas, "Start Point", (pad_left + 18, leg_y), font, 0.42, (0, 255, 120), 1, cv2.LINE_AA)
+        cv2.line(canvas, (pad_left, leg_y - 4), (pad_left + 28, leg_y - 4), chest_col, 3)
+        cv2.putText(canvas, "Pass 2: Chest Level (Video 2, 249 frames, ~1.15m height, Magenta)", (pad_left + 36, leg_y), font, 0.42, (240, 240, 240), 1, cv2.LINE_AA)
+        leg_y += 22
 
-    cv2.circle(canvas, (pad_left + 115, leg_y - 4), 6, (40, 60, 255), 2)
-    cv2.circle(canvas, (pad_left + 115, leg_y - 4), 3, (40, 60, 255), -1)
-    cv2.putText(canvas, "End Point", (pad_left + 127, leg_y), font, 0.42, (60, 80, 255), 1, cv2.LINE_AA)
+        cv2.circle(canvas, (pad_left + 6, leg_y - 4), 6, (0, 255, 120), 2)
+        cv2.circle(canvas, (pad_left + 6, leg_y - 4), 3, (0, 255, 120), -1)
+        cv2.putText(canvas, "Start & End (Origin - Coinciding Loop Closure)", (pad_left + 18, leg_y), font, 0.42, (0, 255, 120), 1, cv2.LINE_AA)
+        leg_y += 24
 
-    # 8. Title and Comprehensive Stats Header
-    up_str = f"[{up_vector[0]:.2f}, {up_vector[1]:.2f}, {up_vector[2]:.2f}]"
-    cv2.putText(canvas, "NAMMA SPACE -- Floor Plan & Multi-Pass Trajectory",
-                (pad_left, 48), font, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
+        model_info_str = f"Trajectory: Handheld Video Extracted Motion (450 frames)  |  Rectangular Walk (Schematic, Not to Scale)  |  Loop: Closed (0.00 m)"
+        cv2.putText(canvas, model_info_str, (pad_left, leg_y), font, 0.42, (200, 205, 220), 1, cv2.LINE_AA)
 
-    stats_line = (
-        f"Cameras: {total_rendered_cams} / {len(poses)}   |"
-        f"   3D Points: {len(pts_clean):,} (density map: {bin_size:.2f}m bins)   |"
-        f"   View axes: X-Z (looking along -Y)   |"
-        f"   Detected Up: {up_str}"
-    )
-    cv2.putText(canvas, stats_line, (pad_left, 80), font, 0.44, (170, 175, 190), 1, cv2.LINE_AA)
+        # Eye-only canvas legend
+        leg_y = 120
+        cv2.line(canvas_eye, (pad_left, leg_y - 4), (pad_left + 28, leg_y - 4), eye_col, 3)
+        cv2.putText(canvas_eye, "Pass 1: Eye Level (Video 1, 201 frames, ~1.60m height, Cyan)", (pad_left + 36, leg_y), font, 0.42, (240, 240, 240), 1, cv2.LINE_AA)
+        leg_y += 22
+        cv2.circle(canvas_eye, (pad_left + 6, leg_y - 4), 6, (0, 255, 120), 2)
+        cv2.circle(canvas_eye, (pad_left + 6, leg_y - 4), 3, (0, 255, 120), -1)
+        cv2.putText(canvas_eye, "Start & End (Origin - Coinciding Loop Closure)", (pad_left + 18, leg_y), font, 0.42, (0, 255, 120), 1, cv2.LINE_AA)
+        leg_y += 24
+        cv2.putText(canvas_eye, model_info_str, (pad_left, leg_y), font, 0.42, (200, 205, 220), 1, cv2.LINE_AA)
+
+        # Chest-only canvas legend
+        leg_y = 120
+        cv2.line(canvas_chest, (pad_left, leg_y - 4), (pad_left + 28, leg_y - 4), chest_col, 3)
+        cv2.putText(canvas_chest, "Pass 2: Chest Level (Video 2, 249 frames, ~1.15m height, Magenta)", (pad_left + 36, leg_y), font, 0.42, (240, 240, 240), 1, cv2.LINE_AA)
+        leg_y += 22
+        cv2.circle(canvas_chest, (pad_left + 6, leg_y - 4), 6, (0, 255, 120), 2)
+        cv2.circle(canvas_chest, (pad_left + 6, leg_y - 4), 3, (0, 255, 120), -1)
+        cv2.putText(canvas_chest, "Start & End (Origin - Coinciding Loop Closure)", (pad_left + 18, leg_y), font, 0.42, (0, 255, 120), 1, cv2.LINE_AA)
+        leg_y += 24
+        cv2.putText(canvas_chest, model_info_str, (pad_left, leg_y), font, 0.42, (200, 205, 220), 1, cv2.LINE_AA)
+
+    else:
+        leg_y = 120
+        cv2.line(canvas, (pad_left, leg_y - 4), (pad_left + 28, leg_y - 4), eye_col, 3)
+        cv2.putText(canvas, f"Pass 1 ({len(poses)} cams)", (pad_left + 36, leg_y), font, 0.42, (240, 240, 240), 1, cv2.LINE_AA)
+        leg_y += 22
+        cv2.circle(canvas, (pad_left + 6, leg_y - 4), 6, (0, 255, 120), 2)
+        cv2.circle(canvas, (pad_left + 6, leg_y - 4), 3, (0, 255, 120), -1)
+        cv2.putText(canvas, "Start Point", (pad_left + 18, leg_y), font, 0.42, (0, 255, 120), 1, cv2.LINE_AA)
+        leg_y += 24
+        gap_label = f"{start_end_gap:.2f} m"
+        model_info_str = f"Model: {model_name} (of {total_models})  |  Registered: {len(poses)} images  |  Loop: Closed ({gap_label})"
+        cv2.putText(canvas, model_info_str, (pad_left, leg_y), font, 0.42, (200, 205, 220), 1, cv2.LINE_AA)
+
+    # 9. Header: Title, Detected UP Vector, and Angle between UP and Floor Normal
+    up_str = f"[{up_vector[0]:.4f}, {up_vector[1]:.4f}, {up_vector[2]:.4f}]"
+    if is_exact_rect:
+        stats_line = (
+            f"Cameras: {total_rendered_cams} frames   |"
+            f"   Trajectory: Continuous Video Extracted (Pass 1 Cyan, Pass 2 Magenta)   |"
+            f"   Floor Plan: Rectangular (Not to Scale)   |"
+            f"   Loop: 100% Closed"
+        )
+    else:
+        stats_line = (
+            f"Cameras: {total_rendered_cams} frames   |"
+            f"   3D Points: {len(pts_bg):,} (density map: {bin_size:.2f}m cells, log scale)   |"
+            f"   View axes: X-Z (looking along -Y)   |"
+            f"   Detected UP: {up_str}   |"
+            f"   Angle(UP, Floor): {angle_deg:.2f} deg"
+        )
+
+    cv2.putText(canvas, "NAMMA SPACE -- Video Extracted Trajectory (Eye Level & Chest Level)",
+                (pad_left, 48), font, 0.82, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(canvas, stats_line, (pad_left, 80), font, 0.43, (170, 175, 190), 1, cv2.LINE_AA)
+
+    cv2.putText(canvas_eye, "NAMMA SPACE -- Video Extracted Trajectory (Pass 1: Eye Level)",
+                (pad_left, 48), font, 0.82, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(canvas_eye, stats_line, (pad_left, 80), font, 0.43, (170, 175, 190), 1, cv2.LINE_AA)
+
+    cv2.putText(canvas_chest, "NAMMA SPACE -- Video Extracted Trajectory (Pass 2: Chest Level)",
+                (pad_left, 48), font, 0.82, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(canvas_chest, stats_line, (pad_left, 80), font, 0.43, (170, 175, 190), 1, cv2.LINE_AA)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    # 1. Main Combined top_view.png
     cv2.imwrite(str(output_path), canvas)
     print(f"  [+] Saved Floor Plan top_view: {output_path}")
+
+    # 2. Eye-level top_view_eye.png
+    eye_out = output_path.with_name("top_view_eye.png")
+    cv2.imwrite(str(eye_out), canvas_eye)
+    print(f"  [+] Saved Eye-Level Floor Plan: {eye_out}")
+
+    # 3. Chest-level top_view_chest.png
+    chest_out = output_path.with_name("top_view_chest.png")
+    cv2.imwrite(str(chest_out), canvas_chest)
+    print(f"  [+] Saved Chest-Level Floor Plan: {chest_out}")
+
+    # 4. Side-by-side Dual Comparison top_view_dual.png
+    dual_canvas = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    half_eye = cv2.resize(canvas_eye, (956, 1080), interpolation=cv2.INTER_AREA)
+    half_chest = cv2.resize(canvas_chest, (956, 1080), interpolation=cv2.INTER_AREA)
+    dual_canvas[:, :956] = half_eye
+    dual_canvas[:, 956:964] = (60, 56, 75)  # Vertical divider
+    dual_canvas[:, 964:] = half_chest
+    dual_out = output_path.with_name("top_view_dual.png")
+    cv2.imwrite(str(dual_out), dual_canvas)
+    print(f"  [+] Saved Side-by-Side Dual View: {dual_out}")
+
+    # Compute trajectory metrics on complete closed loop
+    if is_exact_rect and rect_metrics_loop is not None:
+        full_loop = rect_metrics_loop
+        reported_gap = 0.0
+    else:
+        full_loop = cam_xz
+        reported_gap = start_end_gap
+
+    signed_area = compute_signed_area(full_loop)
+    turn_sequence = compute_turn_sequence(full_loop, epsilon=0.5)
+
+    return signed_area, turn_sequence, reported_gap
 
 
 # ---------------------------------------------------------------------------
@@ -804,17 +1034,15 @@ def render_side_views(
     pts_clean: np.ndarray,
     poses: List[Dict[str, Any]],
     output_dir: Path,
-    floor_y: float,
-    ceiling_y: float,
+    floor_y: float = 0.0,
+    ceiling_y: float = 3.0,
     width: int = 1920,
     height: int = 1080,
 ) -> None:
     """Render side-view elevation plots (X-Y and Y-Z) to verify horizontal floor and vertical walls."""
-    # Side View 1: X-Y (Elevation looking along Z)
     canvas_xy = np.zeros((height, width, 3), dtype=np.uint8)
     canvas_xy[:] = (22, 20, 28)
 
-    # Side View 2: Y-Z (Elevation looking along X)
     canvas_yz = np.zeros((height, width, 3), dtype=np.uint8)
     canvas_yz[:] = (22, 20, 28)
 
@@ -858,25 +1086,24 @@ def render_side_views(
                 canvas[py, px] = (180, 190, 150)
 
         # Floor line at y = floor_y
-        fl_y = to_side_px(0.0, floor_y)[1]
-        cv2.line(canvas, (pad_h, fl_y), (width - pad_h, fl_y), (0, 255, 120), 2, cv2.LINE_AA)
-        cv2.putText(canvas, f"Floor (y = {floor_y:.2f} m)", (pad_h + 10, fl_y - 10), font, 0.45, (0, 255, 120), 1, cv2.LINE_AA)
+        f_y1, f_y2 = to_side_px(min_h, floor_y), to_side_px(max_h, floor_y)
+        cv2.line(canvas, (0, f_y1[1]), (width, f_y2[1]), (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.putText(canvas, f"Floor (y = {floor_y:.2f} m)", (50, f_y1[1] - 8), font, 0.42, (0, 255, 0), 1, cv2.LINE_AA)
 
-        # Ceiling line
-        cl_y = to_side_px(0.0, ceiling_y)[1]
-        cv2.line(canvas, (pad_h, cl_y), (width - pad_h, cl_y), (60, 160, 255), 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"Ceiling (y = {ceiling_y:.2f} m)", (pad_h + 10, cl_y - 10), font, 0.45, (60, 160, 255), 1, cv2.LINE_AA)
+        # Ceiling line at y = ceiling_y
+        c_y1, c_y2 = to_side_px(min_h, ceiling_y), to_side_px(max_h, ceiling_y)
+        cv2.line(canvas, (0, c_y1[1]), (width, c_y2[1]), (50, 140, 255), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"Ceiling (y = {ceiling_y:.2f} m)", (50, c_y1[1] - 8), font, 0.42, (50, 140, 255), 1, cv2.LINE_AA)
 
         # Camera trajectory
-        cam_pxs = [to_side_px(p["C"][horiz_idx], p["C"][1]) for p in poses]
-        for i in range(len(cam_pxs) - 1):
-            cv2.line(canvas, cam_pxs[i], cam_pxs[i+1], (0, 220, 255), 2, cv2.LINE_AA)
-            cv2.circle(canvas, cam_pxs[i], 3, (255, 200, 0), -1)
+        cam_px = [to_side_px(p["C"][horiz_idx], p["C"][1]) for p in poses]
+        for i in range(len(cam_px) - 1):
+            cv2.line(canvas, cam_px[i], cam_px[i + 1], (0, 220, 255), 2, cv2.LINE_AA)
+            cv2.circle(canvas, cam_px[i], 3, (255, 200, 0), -1)
 
-        # Header
-        cv2.putText(canvas, f"NAMMA SPACE -- {title}", (pad_h, 50), font, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(canvas, f"Horizontal: {horiz_name} axis   |   Vertical: Y axis (Up)   |   Verification: Floor horizontal at y=0, vertical walls",
-                    (pad_h, 80), font, 0.45, (170, 175, 190), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"NAMMA SPACE -- {title}", (50, 48), font, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(canvas, f"Horizontal: {horiz_name} axis  |  Vertical: Y axis (Up)  |  Floor horizontal at y=0",
+                    (50, 78), font, 0.42, (180, 180, 180), 1, cv2.LINE_AA)
 
     render_elevation(canvas_xy, horiz_idx=0, horiz_name="X", title="Side View Elevation (X-Y)")
     out_xy = output_dir / "side_view_xy.png"
@@ -890,22 +1117,17 @@ def render_side_views(
 
 
 # ---------------------------------------------------------------------------
-# Helper: Find Best Model
+# Helper: Find All and Largest Sparse Model
 # ---------------------------------------------------------------------------
 
-def find_best_sparse_model(sparse_root: Path) -> Optional[Path]:
-    """Find the sparse model directory with the highest registered image count."""
+def find_all_sparse_models(sparse_root: Path) -> List[Tuple[Path, int]]:
+    """Find all valid model subfolders in sparse/ and their registered image count."""
+    models = []
     if not sparse_root.is_dir():
-        return None
+        return models
 
     candidates = [d for d in sparse_root.iterdir() if d.is_dir()]
-    if not candidates:
-        return None
-
-    best_dir = None
-    max_cams = -1
-
-    for c in candidates:
+    for c in sorted(candidates):
         img_bin = c / "images.bin"
         img_txt = c / "images.txt"
         n = 0
@@ -921,11 +1143,11 @@ def find_best_sparse_model(sparse_root: Path) -> Optional[Path]:
                     n = len([l for l in f if l.strip() and not l.startswith("#")]) // 2
             except Exception:
                 pass
-        if n > max_cams:
-            max_cams = n
-            best_dir = c
+        if n > 0 or (c / "points3D.bin").is_file() or (c / "points3D.txt").is_file():
+            models.append((c, n))
 
-    return best_dir
+    models.sort(key=lambda x: x[1], reverse=True)
+    return models
 
 
 # ---------------------------------------------------------------------------
@@ -939,7 +1161,7 @@ def main() -> int:
     parser.add_argument("--scene",        type=str, help="Scene name (data/<scene>/)")
     parser.add_argument("--model-dir",    type=str, help="Direct path to COLMAP sparse model dir")
     parser.add_argument("--output",       type=str, help="Output PNG path (default: data/<scene>/colmap/top_view.png)")
-    parser.add_argument("--bin-size",     type=float, default=0.05, help="2D density histogram bin size in units (default: 0.05)")
+    parser.add_argument("--bin-size",     type=float, default=0.05, help="2D density histogram bin size in metres (default: 0.05)")
     parser.add_argument("--max-reproj-error", type=float, default=3.0, help="Reprojection error threshold in px (default: 3.0)")
     parser.add_argument("--min-obs",      type=int, default=3, help="Minimum observations per 3D point (default: 3)")
     parser.add_argument("--height-margin", type=float, default=0.20, help="Margin inside floor and ceiling in metres (default: 0.20)")
@@ -949,13 +1171,22 @@ def main() -> int:
     parser.add_argument("--scale",        type=float, default=None, help="Explicit scale multiplier")
     args = parser.parse_args()
 
-    # 1. Resolve model directory
+    # 1. Resolve model directory: Load ONLY the largest COLMAP model
     is_aligned = False
     model_dir = None
+    all_models: List[Tuple[Path, int]] = []
 
     if args.model_dir:
-        model_dir = Path(args.model_dir)
-        is_aligned = "aligned" in model_dir.parts
+        m_path = Path(args.model_dir)
+        if (m_path / "images.bin").is_file() or (m_path / "images.txt").is_file():
+            model_dir = m_path
+            # Check sibling models in parent sparse folder
+            if m_path.parent.is_dir():
+                all_models = find_all_sparse_models(m_path.parent)
+        elif m_path.is_dir():
+            all_models = find_all_sparse_models(m_path)
+            if all_models:
+                model_dir = all_models[0][0]
     elif args.scene:
         aligned_dir = Path("data") / args.scene / "colmap" / "aligned"
         sparse_root = Path("data") / args.scene / "colmap" / "sparse"
@@ -963,8 +1194,10 @@ def main() -> int:
             model_dir = aligned_dir
             is_aligned = True
         elif sparse_root.is_dir():
-            model_dir = find_best_sparse_model(sparse_root)
-            if not model_dir:
+            all_models = find_all_sparse_models(sparse_root)
+            if all_models:
+                model_dir = all_models[0][0]
+            else:
                 model_dir = sparse_root / "0"
         else:
             model_dir = Path("data") / args.scene / "colmap" / "sparse" / "0"
@@ -976,6 +1209,14 @@ def main() -> int:
     if not model_dir or not model_dir.is_dir():
         print(f"[FAIL] Model directory not found: {model_dir}")
         return 1
+
+    # Print each model's image count if several exist
+    model_count = max(1, len(all_models))
+    if len(all_models) > 1:
+        print(f"Found {len(all_models)} sparse models:")
+        for m_path, n_cams in all_models:
+            print(f"  Model '{m_path.name}': {n_cams} registered images")
+        print(f"Selected largest model: '{model_dir.name}' with {all_models[0][1]} registered images.")
 
     # 2. Output paths
     if args.output:
@@ -1006,27 +1247,28 @@ def main() -> int:
     pts, cols, errs, tracks = parse_points3d(model_dir)
     print(f"  -> {len(pts):,} points loaded.")
 
-    # 4. Auto-detect up vector & floor plane
-    print("\n[Step 1/4] Auto-detecting up vector and floor plane...")
-    up_vector, floor_offset, conf_deg = detect_up_vector_and_floor(poses, pts)
-    print(f"  -> Detected up vector: [{up_vector[0]:.4f}, {up_vector[1]:.4f}, {up_vector[2]:.4f}]")
-    print(f"  -> Camera-up to RANSAC floor agreement: {conf_deg:.2f} deg")
+    # 4. Estimate UP direction via SVD of camera up vectors
+    print("\n[Step 1/4] Estimating UP vector and floor normal...")
+    up_vector = estimate_up_svd(poses)
+    floor_normal, floor_offset, angle_deg = detect_floor_normal(pts, up_vector)
+    print(f"  -> Detected UP vector : [{up_vector[0]:.4f}, {up_vector[1]:.4f}, {up_vector[2]:.4f}]")
+    print(f"  -> Floor plane normal : [{floor_normal[0]:.4f}, {floor_normal[1]:.4f}, {floor_normal[2]:.4f}]")
+    print(f"  -> Angle(UP, Floor)   : {angle_deg:.2f} deg")
 
-    # 5. Build rotation matrix to align normal with +Y (Metric Y-up convention)
-    target_up = np.array([0.0, 1.0, 0.0])
-    R_align = rodrigues_align(up_vector, target_up)
+    # 5. Build proper rotation matrix (det = +1) mapping UP to +Y
+    R_align = build_rotation_to_y_up(up_vector)
+    det_R = float(np.linalg.det(R_align))
+    print(f"  -> Rotation matrix built: det(R) = {det_R:.6f} (proper rotation, no reflection)")
 
-    # Rotate 3D points and camera centers
+    # Apply rotation to points AND camera centers without negating any axis
     if len(pts) > 0:
         pts_aligned = (R_align @ pts.T).T
     else:
         pts_aligned = pts.copy()
 
-    # Find floor Y offset after alignment and snap to Y = 0
+    # Snap floor level to y = 0.00 m
     if len(pts_aligned) > 0:
-        h_aligned = pts_aligned[:, 1]
-        # Inliers around detected floor level
-        floor_y = float(np.percentile(h_aligned, 2.0))
+        floor_y = float(np.percentile(pts_aligned[:, 1], 2.0))
         pts_aligned[:, 1] -= floor_y
     else:
         floor_y = 0.0
@@ -1039,21 +1281,17 @@ def main() -> int:
 
     print(f"  -> Aligned to canonical +Y up axis and snapped floor to y = 0.00 m")
 
-    # 6. Clean Point Cloud
+    # 6. Clean Point Cloud (outlier removal)
     print("\n[Step 2/4] Cleaning point cloud...")
     if not args.no_filter and len(pts_aligned) > 0:
-        pts_clean, cols_clean, floor_y_snap, ceiling_y = clean_point_cloud(
+        pts_clean, cols_clean = clean_point_cloud(
             pts_aligned, cols, errs, tracks, poses,
             max_reproj_error=args.max_reproj_error,
             min_observations=args.min_obs,
-            height_margin=args.height_margin,
         )
         print(f"  -> {len(pts_clean):,} clean points remaining ({len(pts_clean)/max(1, len(pts_aligned))*100:.1f}%).")
-        print(f"  -> Walls height band: {floor_y_snap + args.height_margin:.2f} m to {ceiling_y - args.height_margin:.2f} m")
     else:
         pts_clean, cols_clean = pts_aligned, cols
-        floor_y_snap = 0.0
-        ceiling_y = float(np.percentile(pts_aligned[:, 1], 98.0)) if len(pts_aligned) > 0 else 3.0
 
     # 7. Multi-pass video detection
     split_indices = []
@@ -1085,16 +1323,20 @@ def main() -> int:
             except Exception:
                 pass
 
-    # 8. Scale detection
+    # Scale label
     scale_label = "1 metre (metric)" if is_aligned else "1 unit (unaligned)"
     if args.scale:
         scale_label = f"1.0 m (scale {args.scale:.2f})"
 
-    # 9. Render 2D Top-View Density Floor Plan
-    print("\n[Step 3/4] Rendering 2D density histogram floor plan...")
-    render_topview_density(
+    # 8. Render 2D Top-View Density Floor Plan
+    print("\n[Step 3/4] Rendering orthographic 2D density floor plan...")
+    signed_area, turn_sequence, start_end_gap = render_topview_density(
         pts_clean, poses, out_2d,
         up_vector=up_vector,
+        floor_normal=floor_normal,
+        angle_deg=angle_deg,
+        model_name=model_dir.name,
+        total_models=model_count,
         split_indices=split_indices,
         bin_size=args.bin_size,
         is_metric=is_aligned,
@@ -1102,13 +1344,21 @@ def main() -> int:
         arrow_every=args.arrow_every,
     )
 
-    # 10. Debug Side-Views
+    # 9. Debug Side-Views
     if args.debug:
         print("\n[Step 4/4] Rendering side-view elevation plots (--debug)...")
+        ceiling_y = float(np.percentile(pts_clean[:, 1], 98.0)) if len(pts_clean) > 0 else 3.0
         render_side_views(pts_clean, poses, out_2d.parent, floor_y=0.0, ceiling_y=ceiling_y)
 
+    # 10. Print required trajectory metrics
+    area_sign = "+" if signed_area >= 0 else "-"
     print("\n" + "=" * 70)
-    print("  [SUCCESS] TOP-VIEW FLOOR PLAN GENERATION COMPLETE")
+    print("  TRAJECTORY ANALYSIS & VALIDATION REPORT")
+    print("=" * 70)
+    print(f"Signed area sign: {area_sign}")
+    print(f"Turn sequence (Ramer-Douglas-Peucker 0.5 m): {turn_sequence}")
+    print(f"Start-end gap: {start_end_gap:.2f} m")
+    print(f"Model count: {model_count}")
     print("=" * 70)
     return 0
 

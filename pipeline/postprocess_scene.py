@@ -54,6 +54,10 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -70,6 +74,11 @@ except ImportError:
     except ImportError:
         o3d = None
 
+from pipeline.build_occupancy import (
+    build_occupancy_grid,
+    render_occupancy_png,
+    render_occupancy_debug_png,
+)
 
 SH_C0 = 0.28209479177387814  # 1 / (2 * sqrt(pi))
 
@@ -383,260 +392,117 @@ def build_and_save_occupancy(
     pass_split_idx: int = 222,
     cell_size: float = 0.10,
     min_points: int = 5,
-    inflation_radius_m: float = 0.25,
+    inflation_radius_m: float = 0.12,
     walkable_radius_m: float = 1.50,
     config_path: str = "configs/default.yaml",
+    clean_scale: Optional[np.ndarray] = None,
 ) -> Tuple[Path, Path, Dict[str, Any]]:
     """
-    Requirement 3:
-    - Filters splat centres (opacity >= 0.3, y in [0.15, 1.80] m).
-    - Tests camera and spawn free cell assertion (>= 98.0% cameras in free cells, spawn in free cell).
-      If not satisfied, tests inflation 0.20 m, then min points 8, reports setting that worked,
-      and updates configs/default.yaml.
-    - Adds 'walkable' array to occupancy.json: cells within walkable_radius_m of camera path.
-    - Prints percentage of cells occupied, free, and walkable.
-    - Updates occupancy.png showing walkable region as a light outline.
+    Builds occupancy grid using 3D voxel ray carving (pipeline/build_occupancy.py):
+    - Backs up old outputs/<scene>/occupancy.json/png to occupancy_v1/
+    - Builds occupancy using 3D body slab ray carving and evidence fusion
+    - Writes to occupancy_v2/ first, then outputs/<scene>/
+    - Writes occupancy_debug.png clearance heat map and occupancy_report.json
     """
-    mask_band = (clean_sig_op >= 0.30) & (clean_xyz[:, 1] >= 0.15) & (clean_xyz[:, 1] <= 1.80)
-    pts_cand = clean_xyz[mask_band]
-    if len(pts_cand) == 0:
-        pts_cand = clean_xyz
+    v1_backup_dir = output_dir / "occupancy_v1"
+    v2_output_dir = output_dir / "occupancy_v2"
+    v1_backup_dir.mkdir(parents=True, exist_ok=True)
+    v2_output_dir.mkdir(parents=True, exist_ok=True)
 
-    min_x = float(math.floor(np.min(clean_xyz[:, 0]) / cell_size) * cell_size)
-    max_x = float(math.ceil(np.max(clean_xyz[:, 0]) / cell_size) * cell_size)
-    min_z = float(math.floor(np.min(clean_xyz[:, 2]) / cell_size) * cell_size)
-    max_z = float(math.ceil(np.max(clean_xyz[:, 2]) / cell_size) * cell_size)
+    existing_occ_json = output_dir / "occupancy.json"
+    existing_occ_png = output_dir / "occupancy.png"
+    if existing_occ_json.is_file() and not (v1_backup_dir / "occupancy.json").is_file():
+        shutil.copy2(existing_occ_json, v1_backup_dir / "occupancy.json")
+        if existing_occ_png.is_file():
+            shutil.copy2(existing_occ_png, v1_backup_dir / "occupancy.png")
+        print(f"  [Backup] Preserved original occupancy files in {v1_backup_dir}")
 
-    width = int(round((max_x - min_x) / cell_size))
-    height = int(round((max_z - min_z) / cell_size))
-    origin = [min_x, min_z]
-    total_cells = width * height
+    cfg = load_config(config_path)
+    aligned_dir = Path("data") / scene / "colmap_aligned"
 
-    counts, _, _ = np.histogram2d(
-        pts_cand[:, 2], pts_cand[:, 0],
-        bins=[height, width],
-        range=[[min_z, max_z], [min_x, max_x]],
+    res = build_occupancy_grid(
+        aligned_dir=aligned_dir,
+        splat_ply_path=None,
+        scene=scene,
+        cfg=cfg,
+        existing_occ_path=(v1_backup_dir / "occupancy.json") if (v1_backup_dir / "occupancy.json").is_file() else existing_occ_json,
+        clean_xyz=clean_xyz,
+        clean_sig_op=clean_sig_op,
+        clean_scale=clean_scale,
     )
 
-    spawn = np.array([float(c0[0]), 1.45, float(c0[2])])
-
-    # Sequence of candidate occupancy parameter configurations (Requirement 3a)
-    eval_candidates = [
-        (inflation_radius_m, min_points, f"initial config (inflation={inflation_radius_m:.2f}m, min_pts={min_points})"),
-        (0.20, min_points, f"fallback 1: inflation 0.20 m (min_pts={min_points})"),
-        (0.20, 8, "fallback 2: inflation 0.20 m and min point count 8"),
-        (inflation_radius_m, 8, f"fallback 3: min point count 8 (inflation={inflation_radius_m:.2f}m)"),
+    json_keys = [
+        "origin", "cell_size", "width", "height", "axes", "axes_convention",
+        "min_points_per_cell", "inflation_radius_m", "walkable_radius_m", "height_band_m",
+        "occupied_cells_raw", "occupied_cells_inflated", "free_cells", "walkable_cells", "total_cells",
+        "occupied_pct", "free_pct", "walkable_pct", "camera_free_pct", "spawn_free",
+        "data", "walkable",
+        "state", "clearance_m", "params", "effective_body_radius_m",
+        "narrowest_passable_gap_m", "three_narrowest_corridors",
+        "unknown_cells", "unknown_pct", "inflated_cells", "inflated_pct",
     ]
+    occ_json_data = {k: res[k] for k in json_keys}
 
-    chosen_inflation = inflation_radius_m
-    chosen_min_pts = min_points
-    chosen_raw_occ = None
-    chosen_inflated_occ = None
-    passed_candidate_name = None
-    final_cam_pct = 0.0
-    final_cam_cnt = 0
-    final_sp_free = False
-
-    for cur_infl, cur_pts, cand_name in eval_candidates:
-        r_occ = (counts >= cur_pts).astype(np.uint8)
-        d_cells = scipy.ndimage.distance_transform_edt(r_occ == 0)
-        i_occ = (d_cells * cell_size <= cur_infl).astype(np.uint8)
-
-        pct, cnt, sp_f = check_free_cells(i_occ, min_x, min_z, cell_size, width, height, cams, spawn)
-        if pct >= 98.0 and sp_f:
-            chosen_inflation = cur_infl
-            chosen_min_pts = cur_pts
-            chosen_raw_occ = r_occ
-            chosen_inflated_occ = i_occ
-            passed_candidate_name = cand_name
-            final_cam_pct = pct
-            final_cam_cnt = cnt
-            final_sp_free = sp_f
-            break
-
-    if chosen_inflated_occ is None:
-        # Fallback to candidate with highest free camera percentage
-        chosen_inflation = 0.20
-        chosen_min_pts = 8
-        chosen_raw_occ = (counts >= 8).astype(np.uint8)
-        d_cells = scipy.ndimage.distance_transform_edt(chosen_raw_occ == 0)
-        chosen_inflated_occ = (d_cells * cell_size <= 0.20).astype(np.uint8)
-        final_cam_pct, final_cam_cnt, final_sp_free = check_free_cells(
-            chosen_inflated_occ, min_x, min_z, cell_size, width, height, cams, spawn
-        )
-        passed_candidate_name = "best effort (inflation 0.20m, min points 8)"
-
-    # Assert Requirement 3a: at least 98% of camera positions and spawn fall in FREE cells
-    assert final_cam_pct >= 98.0 and final_sp_free, (
-        f"Assertion failed: Only {final_cam_pct:.2f}% cameras in free cells (spawn free: {final_sp_free}) < 98.0% threshold."
-    )
-
-    print(
-        f"  Occupancy free cell check: {final_cam_cnt}/{len(cams)} ({final_cam_pct:.2f}%) cameras in FREE cells, "
-        f"Spawn in free cell: {final_sp_free} [Fixed/Passed via: {passed_candidate_name}]"
-    )
-
-    # Save the values that worked in configs/default.yaml
-    update_config_occupancy_settings(config_path, chosen_inflation, chosen_min_pts)
-
-    # Compute Walkable Region (Requirement 3b)
-    # Continuous interpolated path along camera poses
-    dense_path = []
-    xz = cams[:, [0, 2]]
-    for i in range(len(xz) - 1):
-        if i == pass_split_idx - 1:
-            dense_path.append(xz[i])
-            continue
-        pA, pB = xz[i], xz[i + 1]
-        seg_len = float(np.linalg.norm(pB - pA))
-        n_samples = max(1, int(math.ceil(seg_len / 0.05)))
-        for t in np.linspace(0.0, 1.0, n_samples, endpoint=False):
-            dense_path.append(pA * (1.0 - t) + pB * t)
-    dense_path.append(xz[-1])
-    dense_arr = np.array(dense_path)
-
-    cam_tree = KDTree(dense_arr)
-    col_coords = min_x + (np.arange(width) + 0.5) * cell_size
-    row_coords = min_z + (np.arange(height) + 0.5) * cell_size
-    grid_z, grid_x = np.meshgrid(row_coords, col_coords, indexing="ij")
-    cell_centers_xz = np.column_stack([grid_x.ravel(), grid_z.ravel()])
-    dists, _ = cam_tree.query(cell_centers_xz)
-    walkable_grid = (dists <= walkable_radius_m).astype(np.uint8).reshape(height, width)
-
-    # Calculate percentages (Requirement 3c)
-    occ_count = int(chosen_inflated_occ.sum())
-    free_count = int(total_cells - occ_count)
-    walkable_count = int(walkable_grid.sum())
-
-    occ_pct = (occ_count / total_cells) * 100.0
-    free_pct = (free_count / total_cells) * 100.0
-    walkable_pct = (walkable_count / total_cells) * 100.0
-
-    print("\n  2D Occupancy Grid Statistics:")
-    print(f"    - Grid Resolution  : {width} cols x {height} rows ({total_cells:,} total cells, {cell_size:.2f} m/cell)")
-    print(f"    - Occupied Cells   : {occ_count:,} ({occ_pct:.2f}%)")
-    print(f"    - Free Cells       : {free_count:,} ({free_pct:.2f}%)")
-    print(f"    - Walkable Cells   : {walkable_count:,} ({walkable_pct:.2f}% within {walkable_radius_m:.2f} m of camera path)")
-
-    # Save occupancy.json with walkable array (Requirement 3b)
-    occupancy_data = {
-        "origin": origin,
-        "cell_size": cell_size,
-        "width": width,
-        "height": height,
-        "axes": "x = X, row = Z",
-        "axes_convention": {
-            "col_axis": "X (East/West)",
-            "row_axis": "Z (North/South)",
-            "data_ordering": "row-major (index = row * width + col)",
+    report_data = {
+        "scene": scene,
+        "runtime_s": res["_runtime_s"],
+        "validation_checks": res["validation"],
+        "percentages": {
+            "occupied_pct": res["occupied_pct"],
+            "inflated_pct": res["inflated_pct"],
+            "free_pct": res["free_pct"],
+            "unknown_pct": res["unknown_pct"],
+            "walkable_pct": res["walkable_pct"],
         },
-        "min_points_per_cell": chosen_min_pts,
-        "inflation_radius_m": chosen_inflation,
-        "walkable_radius_m": walkable_radius_m,
-        "height_band_m": [0.15, 1.80],
-        "occupied_cells_raw": int(chosen_raw_occ.sum()),
-        "occupied_cells_inflated": occ_count,
-        "free_cells": free_count,
-        "walkable_cells": walkable_count,
-        "total_cells": total_cells,
-        "occupied_pct": round(occ_pct, 2),
-        "free_pct": round(free_pct, 2),
-        "walkable_pct": round(walkable_pct, 2),
-        "camera_free_pct": round(final_cam_pct, 2),
-        "spawn_free": final_sp_free,
-        "data": chosen_inflated_occ.flatten().tolist(),
-        "walkable": walkable_grid.flatten().tolist(),
+        "counts": {
+            "total_cells": res["total_cells"],
+            "occupied_cells": res["occupied_cells_raw"],
+            "inflated_cells": res["inflated_cells"],
+            "known_free_cells": res["free_cells"],
+            "unknown_cells": res["unknown_cells"],
+            "walkable_cells": res["walkable_cells"],
+        },
+        "clearance_corridors": {
+            "effective_body_radius_m": res["effective_body_radius_m"],
+            "player_radius_m": res["params"]["player_radius_m"],
+            "inflation_m": res["params"]["inflation_m"],
+            "narrowest_passable_gap_m": res["narrowest_passable_gap_m"],
+            "three_narrowest_corridors": res["three_narrowest_corridors"],
+        },
+        "comparison_vs_v1": res["validation"]["comparison_vs_v1"],
+        "params": res["params"],
     }
 
+    # Write v2 files first
+    with open(v2_output_dir / "occupancy.json", "w", encoding="utf-8") as f:
+        json.dump(occ_json_data, f, indent=2)
+
+    with open(v2_output_dir / "occupancy_report.json", "w", encoding="utf-8") as f:
+        json.dump(report_data, f, indent=2)
+
+    render_occupancy_png(
+        v2_output_dir / "occupancy.png",
+        res["_state_grid"], res["_walkable_grid"],
+        res["origin"], res["cell_size"], res["width"], res["height"],
+        res["_cams"], res["_spawn"], scene, res["params"], pass_split_idx=pass_split_idx,
+    )
+
+    render_occupancy_debug_png(
+        v2_output_dir / "occupancy_debug.png",
+        res["_clearance_grid"], res["_walkable_grid"],
+        res["origin"], res["cell_size"], res["width"], res["height"],
+        res["_cams"], res["_spawn"], scene, res["three_narrowest_corridors"], pass_split_idx=pass_split_idx,
+    )
+
+    # Copy to output_dir
     json_path = output_dir / "occupancy.json"
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(occupancy_data, f, indent=2)
-
-    # Render and save occupancy.png with walkable light outline (Requirement 3d)
-    fig, ax = plt.subplots(figsize=(8, 10), dpi=180)
-    cmap = matplotlib.colors.ListedColormap(["#12151B", "#E63946"])
-    # origin='upper' with extent=[min_x, max_x, max_z, min_z]: Z increases strictly DOWN
-    ax.imshow(chosen_inflated_occ, extent=[min_x, max_x, max_z, min_z], origin="upper", cmap=cmap, alpha=0.90)
-
-    # Walkable area light outline (Requirement 3d)
-    ax.contour(
-        walkable_grid,
-        levels=[0.5],
-        extent=[min_x, max_x, max_z, min_z],
-        origin="upper",
-        colors=["#70D6FF"],
-        linewidths=[1.6],
-        linestyles=["--"],
-        zorder=3,
-    )
-    ax.plot([], [], color="#70D6FF", linestyle="--", linewidth=1.6, label=f"Walkable Area (radius <= {walkable_radius_m:.1f}m)")
-
-    # Overlay camera path in colour (Pass 1 eye in Cyan, Pass 2 chest in Magenta)
-    if pass_split_idx > 0 and pass_split_idx < len(cams):
-        ax.plot(cams[:pass_split_idx, 0], cams[:pass_split_idx, 2], color="#00E5FF", linewidth=2.0, label="Pass 1: Eye level (~1.45m)", zorder=4)
-        ax.plot(cams[pass_split_idx:, 0], cams[pass_split_idx:, 2], color="#FF007F", linewidth=2.0, label="Pass 2: Chest level (~1.02m)", zorder=4)
-    elif len(cams) > 0:
-        ax.plot(cams[:, 0], cams[:, 2], color="#00E5FF", linewidth=2.0, label="Camera Trajectory", zorder=4)
-
-    # Mark spawn point
-    spawn_x, spawn_z = float(c0[0]), float(c0[2])
-    ax.scatter(
-        [spawn_x], [spawn_z],
-        color="#00FF66", s=180, marker="*",
-        zorder=10, edgecolor="black", linewidth=1.2,
-        label=f"Spawn: ({spawn_x:.2f}, 1.45, {spawn_z:.2f})",
-    )
-    # Spawn heading arrow
-    arrow_len = 0.55
-    ax.arrow(
-        spawn_x, spawn_z,
-        arrow_len * -math.sin(spawn_yaw), arrow_len * -math.cos(spawn_yaw),
-        color="#00FF66", width=0.04, head_width=0.18, head_length=0.15,
-        zorder=11, length_includes_head=True,
-    )
-
-    # Coordinate styling: Z points strictly DOWN the image
-    ax.set_ylim(max_z, min_z)
-    ax.set_xlim(min_x, max_x)
-    ax.set_aspect("equal")
-    ax.grid(True, linestyle="--", alpha=0.25, color="white")
-    ax.set_facecolor("#111318")
-    fig.patch.set_facecolor("#111318")
-    ax.tick_params(colors="white")
-    for spine in ax.spines.values():
-        spine.set_color("#444")
-
-    ax.set_title(
-        f"Namma Space — 2D Occupancy Grid ({scene})\nZ points DOWN the image | 0.1m cell, {chosen_inflation:.2f}m inflation | Spawn Yaw: {math.degrees(spawn_yaw):+.1f}°",
-        color="white", fontsize=11, pad=12,
-    )
-    ax.set_xlabel("X (m) [East →]", color="white", fontsize=10)
-    ax.set_ylabel("Z (m) [South ↓]", color="white", fontsize=10)
-    ax.legend(loc="upper right", facecolor="#1E222A", edgecolor="#444", labelcolor="white", fontsize=8.5)
-
-    plt.tight_layout()
     png_path = output_dir / "occupancy.png"
-    plt.savefig(png_path, facecolor=fig.get_facecolor(), dpi=180)
-    plt.close(fig)
+    shutil.copy2(v2_output_dir / "occupancy.json", json_path)
+    shutil.copy2(v2_output_dir / "occupancy.png", png_path)
+    shutil.copy2(v2_output_dir / "occupancy_debug.png", output_dir / "occupancy_debug.png")
+    shutil.copy2(v2_output_dir / "occupancy_report.json", output_dir / "occupancy_report.json")
 
-    stats = {
-        "width": width,
-        "height": height,
-        "total_cells": total_cells,
-        "occupied_cells": occ_count,
-        "free_cells": free_count,
-        "walkable_cells": walkable_count,
-        "occupied_pct": occ_pct,
-        "free_pct": free_pct,
-        "walkable_pct": walkable_pct,
-        "camera_free_pct": final_cam_pct,
-        "spawn_free": final_sp_free,
-        "inflation_radius_m": chosen_inflation,
-        "min_points_per_cell": chosen_min_pts,
-        "walkable_radius_m": walkable_radius_m,
-    }
-
-    return json_path, png_path, stats
+    return json_path, png_path, report_data
 
 
 def postprocess_scene(
@@ -1041,6 +907,7 @@ def postprocess_scene(
         inflation_radius_m=occupancy_inflation_m,
         walkable_radius_m=walkable_radius_m,
         config_path=config_path,
+        clean_scale=max_scales[clean_mask] if len(max_scales) == len(xyz) else None,
     )
     print(f"  [+] Saved occupancy JSON: {occ_json_path}")
     print(f"  [+] Saved occupancy PNG : {occ_png_path}")

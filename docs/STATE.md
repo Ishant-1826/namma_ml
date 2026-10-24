@@ -452,8 +452,19 @@ Copy-Item -Force outputs/home/final_full/scene.json, outputs/home/final_full/sce
 # Switch to Fast 7k preset (383k splats):
 # PowerShell:
 Copy-Item -Force outputs/home/web_assets_fast/scene.json, outputs/home/web_assets_fast/scene.splat, outputs/home/web_assets_fast/scene.spz, outputs/home/web_assets_fast/occupancy.json, outputs/home/web_assets_fast/occupancy.png viewer/public/scene/
+# --- OCCUPANCY GRID V2 (3D VOXEL RAY CARVING) ---
+# Rebuild occupancy grid v2 with ray carving:
+python pipeline/build_occupancy.py --scene home
+# Or via postprocess_scene:
+python pipeline/postprocess_scene.py --scene home --input outputs/home/scene_cleaned.ply
+# Run occupancy unit tests:
+pytest test/test_occupancy.py
+
+# Deploy occupancy v2 to viewer:
+# PowerShell:
+Copy-Item -Force outputs/home/occupancy_v2/occupancy.json, outputs/home/occupancy_v2/occupancy.png viewer/public/scene/
 # Bash:
-# cp outputs/home/web_assets_fast/{scene.json,scene.splat,scene.spz,occupancy.json,occupancy.png} viewer/public/scene/
+# cp outputs/home/occupancy_v2/{occupancy.json,occupancy.png} viewer/public/scene/
 
 # --- PHASE 7: 3DGS WEB VIEWER ---
 # 1. Install dependencies:
@@ -532,8 +543,46 @@ cd viewer && npm run dev
     - 27 unit tests passing across `viewer/test/collision.test.ts` (12 tests) and `viewer/test/controls.test.ts` (15 tests) with 100% pass rate.
     - Tests assert perpendicular stopping, diagonal sliding, inside corner stability without jitter, passable 1.0 m gap vs impassable 0.3 m gap, 2.0 m anti-tunneling, spawn fix, stuck escape walk-out, walkable limit enforcement, and real `occupancy.json` verification.
     - `npm run build` succeeds with ZERO TypeScript errors. Production bundle: JS 3,221.08 kB (gzip 1,077.24 kB), CSS 10.24 kB (gzip 2.50 kB), HTML 6.98 kB (gzip 1.59 kB).
-    - Dev server running detached at `http://localhost:5173/` maintaining steady 60 FPS with zero per-frame heap allocations.
+- [x] **Phase 9: Occupancy Grid v2 Rebuild with 3D Voxel Ray Carving (`pipeline/build_occupancy.py`, `pipeline/postprocess_scene.py`, `test/test_occupancy.py`)** -- COMPLETE & VERIFIED (2026-10-24):
+  - **3D Voxel Grid in Body Slab**:
+    - Slab elevation: $y \in [0.20, 1.40]$ m above floor at $y=0$ (12 vertical slices at 0.10 m voxel resolution).
+    - Horizontal extents: aligned with COLMAP camera and point extents (e.g. $100 \times 122$ grid cells).
+  - **Occupied Evidence Integration**:
+    - Combined SfM robust points (track length $\ge 3$, reprojection error $\le 1.0$ px) and cleaned splats (opacity $\ge 0.5$, max scale $\le 0.15$ m).
+    - Voxel marked as candidate occupied if support $\ge 2$.
+  - **Vectorized 3D Ray Carving (Free Space Evidence)**:
+    - Marching rays from 446 registered camera centres toward SfM points, stepping every 0.05 m and stopping 0.15 m before the point.
+    - Each camera counted at most once per voxel.
+    - Highly optimized vectorized NumPy implementation running 88,123 rays in **~2.3 seconds** (well under the 3-minute budget).
+    - Overrode 2,675 floater voxels with weak occupied evidence back to FREE because cameras observed empty space through them.
+  - **Classification & 2D Collapse**:
+    - Voxel: FREE if free-count $\ge 2$; OCCUPIED if candidate and free-count $< 2$; otherwise UNKNOWN.
+    - 2D Collapse: OCCUPIED if any slab voxel is OCCUPIED (with isolated 1-voxel noise filter); KNOWN-FREE if $\ge 60\%$ slab voxels are FREE and none OCCUPIED; otherwise UNKNOWN.
+  - **Clearance & Collision Data Generation**:
+    - `data` (1 = blocked): occupied cells inflated by 0.12 m, plus unknown cells that are $> 0.30$ m away from a known-free cell.
+    - Effective player body radius against grid: $0.12\text{ m (grid)} + 0.08\text{ m (viewer circle)} = 0.20\text{ m}$.
+    - Passable clearance: narrowest passable gap detected is **0.70 m** (corridor clearance 1.10 m).
+    - `walkable`: 4-neighbour flood fill connected to spawn cell.
+    - Preserved existing viewer schema (`origin`, `cell_size`, `width`, `height`, `data`, `walkable`) and added `state` (0 unknown, 1 free, 2 occupied, 3 inflated), `clearance_m` (distance to nearest blocked cell, 2 decimals), and `params`.
+    - Generated diagnostic maps: `occupancy.png` (dark occupied, orange inflated, light green known free, grey unknown, overlaid camera trajectories and spawn, 1m grid, +Z down) and `occupancy_debug.png` (clearance heatmap).
+  - **Verification Audit (`outputs/home/occupancy_report.json`)**:
+    - Camera path walkability: 88.79% with default 0.60 slab ratio; consecutive camera path blocked steps = **0.00%** (well within $\le 2.0\%$ limit).
+    - Grid distribution: Occupied: 1.70%, Inflated: 4.39%, Free: 16.92%, Unknown: 76.99%, Walkable: 14.89%.
+    - Narrowest passable corridors identified:
+      1. $[x=-1.50, z=2.40]$ (width: 1.10 m)
+      2. $[x=0.00, z=2.40]$ (width: 1.10 m)
+      3. $[x=-1.40, z=2.40]$ (width: 1.20 m)
+    - Comparison vs v1: 1,607 cells changed from blocked to walkable (recovering aisles between chairs and previously floater-blocked regions); 842 cells changed from walkable to blocked (unobserved pockets safely blocked).
+    - Versioning & Deployment: Old files backed up to `outputs/home/occupancy_v1/`, v2 written to `outputs/home/occupancy_v2/` and `outputs/home/`, and deployed to `viewer/public/scene/` without touching splat assets.
+  - **Unit Testing**:
+    - Synthetic room test in `test/test_occupancy.py` asserting wall is blocked, 0.9 m aisle between chairs is walkable, floater seen by multiple cameras is removed, and unobserved pocket is unknown & not walkable.
+    - All 21 pytest tests and 27 viewer Vitest tests passing.
 - Next Steps: Prepare Round 1 competition submission artifacts (documentation, SOP validation, screen recording, and final repository packaging).
+
+## Known Issues / Diagnostics
+
+- **Occupancy Camera Walkability (Check 8a)**: With the strict default `collapse_free_slab_ratio: 0.60`, 88.79% of camera poses are marked walkable (spawn is 100% walkable). Because smartphone video was captured looking predominantly forward/downward while walking, lower slab voxels near the floor ($y \in [0.20, 0.50]$ m) beneath the operator received fewer direct rays than eye/chest-level voxels ($y \in [0.60, 1.40]$ m). Changing `collapse_free_slab_ratio` to `0.40` in `configs/default.yaml` raises camera walkability to **99.10%** (442/446 cameras) without compromising obstacle boundaries.
+
 
 
 

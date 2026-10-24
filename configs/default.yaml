@@ -59,7 +59,25 @@ postprocess:
   max_scale_m: 0.5
   occupancy_cell_size_m: 0.1
   occupancy_min_points: 8
-  occupancy_inflation_m: 0.2
+  occupancy_inflation_m: 0.12
+occupancy:
+  slab_y_min_m: 0.20
+  slab_y_max_m: 1.40
+  voxel_size_m: 0.10
+  occ_sfm_min_track: 3
+  occ_sfm_max_error: 1.0
+  occ_splat_min_opacity: 0.5
+  occ_splat_max_scale: 0.15
+  occ_min_support: 2
+  free_min_cameras: 2
+  free_ray_step_m: 0.05
+  free_ray_stop_before_point_m: 0.15
+  free_sfm_subsample: 1
+  collapse_free_slab_ratio: 0.60
+  remove_isolated_occupied: true
+  inflation_m: 0.12
+  player_radius_m: 0.08
+  unknown_ok_radius_m: 0.30
 convention:
   up: Y
   handedness: right

@@ -13,6 +13,9 @@
   <!-- In-Game Crosshair (shown only when locked) -->
   <div id="crosshair"></div>
 
+  <!-- Unreconstructed Area HUD Label (Key U Explore Mode) -->
+  <div id="hud-unreconstructed" class="hud-unreconstructed hidden">unreconstructed area</div>
+
   <!-- Minimap Container (Key B toggles, default OFF, pointer-events: none) -->
   <div id="minimap-container" class="hidden">
     <div class="minimap-header">
@@ -83,6 +86,10 @@
         <span class="stats-label">Minimap:</span>
         <span class="stats-value" id="stats-minimap">OFF (Key B)</span>
       </div>
+      <div class="stats-item">
+        <span class="stats-label">Explore Unknown:</span>
+        <span class="stats-value" id="stats-explore">OFF (Key U)</span>
+      </div>
     </div>
   </div>
 
@@ -111,6 +118,10 @@
           <div class="control-row">
             <span class="key-badge">Shift</span>
             <span class="control-desc">Sprint (2x speed, 2.8 m/s)</span>
+          </div>
+          <div class="control-row">
+            <span class="key-badge">U</span>
+            <span class="control-desc">Explore unreconstructed areas (Toggle)</span>
           </div>
           <div class="control-row">
             <span class="key-badge">B</span>

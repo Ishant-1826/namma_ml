@@ -152,6 +152,33 @@ def compute_signed_area(path_xz: np.ndarray) -> float:
     return 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
 
 
+def get_source_name(name: str) -> str:
+    """Extract source folder name from image path."""
+    norm_name = name.replace("\\", "/")
+    parts = norm_name.split("/")
+    if len(parts) > 1:
+        return parts[0]
+    nl = name.lower()
+    if "video1" in nl:
+        return "video1"
+    if "video2" in nl:
+        return "video2"
+    return "source"
+
+
+SOURCE_PALETTE = {
+    "20261021_195555": ("#1f77b4", "o", "Pass 1 Eye (1.45m)"),
+    "video1": ("#1f77b4", "o", "Pass 1 Eye (1.45m)"),
+    "20261021_195930": ("#e377c2", "s", "Pass 2 Chest"),
+    "video2": ("#e377c2", "s", "Pass 2 Chest"),
+    "sweep_1": ("#ff7f0e", "^", "Sweep 1"),
+    "sweep_2": ("#2ca02c", "v", "Sweep 2"),
+    "sweep_3": ("#d62728", "<", "Sweep 3"),
+    "sweep_4": ("#9467bd", ">", "Sweep 4"),
+    "stills": ("#8c564b", "*", "Stills"),
+}
+
+
 # ---------------------------------------------------------------------------
 # Point Filtering and Ceiling Estimation
 # ---------------------------------------------------------------------------
@@ -266,6 +293,7 @@ def plot_top_view(
     header_line1: str,
     header_line2: str,
     start_end_gap: float,
+    source_cameras: Optional[Dict[str, np.ndarray]] = None,
     fig: Optional[plt.Figure] = None,
     ax: Optional[plt.Axes] = None,
 ) -> Tuple[plt.Figure, plt.Axes]:
@@ -291,10 +319,31 @@ def plot_top_view(
         alpha=0.85,
     )
 
-    # Plot camera trajectory color-coded by time
-    t_vals = np.linspace(0.0, 1.0, len(cam_centers))
-    ax.scatter(cam_centers[:, 0], cam_centers[:, 2], c=t_vals, cmap="coolwarm", s=12, zorder=5, label="Cameras (Time)")
-    ax.plot(cam_centers[:, 0], cam_centers[:, 2], color="darkblue", alpha=0.4, linewidth=1.2, zorder=4)
+    # Plot camera centres coloured by source
+    if source_cameras and len(source_cameras) > 0:
+        for s_name, s_pts in sorted(source_cameras.items()):
+            if len(s_pts) == 0:
+                continue
+            color, marker, label = SOURCE_PALETTE.get(s_name, ("#7f7f7f", "o", s_name))
+            is_stills = "still" in s_name.lower()
+            sz = 60 if is_stills else 14
+            ax.scatter(
+                s_pts[:, 0],
+                s_pts[:, 2],
+                color=color,
+                marker=marker,
+                s=sz,
+                edgecolor="black" if is_stills else "none",
+                linewidth=0.8 if is_stills else 0,
+                zorder=7 if is_stills else 5,
+                label=f"{label} ({len(s_pts)})",
+            )
+            if not is_stills and len(s_pts) > 1:
+                ax.plot(s_pts[:, 0], s_pts[:, 2], color=color, alpha=0.45, linewidth=1.2, zorder=4)
+    else:
+        t_vals = np.linspace(0.0, 1.0, len(cam_centers))
+        ax.scatter(cam_centers[:, 0], cam_centers[:, 2], c=t_vals, cmap="coolwarm", s=12, zorder=5, label="Cameras (Time)")
+        ax.plot(cam_centers[:, 0], cam_centers[:, 2], color="darkblue", alpha=0.4, linewidth=1.2, zorder=4)
 
     # Direction arrows every ~5 seconds (~15 frames at 3 fps)
     arrow_step = max(15, len(cam_centers) // 25)
@@ -335,6 +384,79 @@ def plot_top_view(
     ax.set_ylabel("Z (metres)  [↑ North (-Z), South (+Z) ↓]", fontsize=11, fontweight="bold")
     ax.set_title(f"TOP-DOWN VIEW (top.png)\n{header_line1}\n{header_line2}", fontsize=9, pad=12)
     ax.legend(loc="upper right", framealpha=0.9, fontsize=8)
+
+    return fig, ax
+
+
+def plot_coverage_map(
+    points: dict,
+    x_min: float,
+    x_max: float,
+    z_min: float,
+    z_max: float,
+    header_line1: str,
+    source_cameras: Optional[Dict[str, np.ndarray]] = None,
+    cell_size: float = 0.5,
+) -> Tuple[plt.Figure, plt.Axes]:
+    """Generate coverage.png: number of distinct cameras observing points in each 0.5m cell."""
+    fig, ax = plt.subplots(figsize=(10, 10), dpi=150)
+
+    bx = np.arange(x_min, x_max + cell_size, cell_size)
+    bz = np.arange(z_min, z_max + cell_size, cell_size)
+    nx = len(bx) - 1
+    nz = len(bz) - 1
+
+    cell_obs = [[set() for _ in range(nz)] for _ in range(nx)]
+
+    for p in points.values():
+        xyz = p["xyz"]
+        col = int((xyz[0] - x_min) / cell_size)
+        row = int((xyz[2] - z_min) / cell_size)
+        if 0 <= col < nx and 0 <= row < nz:
+            track_tokens = p.get("track", "").split()
+            img_ids = [int(track_tokens[2 * k]) for k in range(len(track_tokens) // 2)]
+            cell_obs[col][row].update(img_ids)
+
+    cov_grid = np.zeros((nx, nz), dtype=int)
+    for i in range(nx):
+        for j in range(nz):
+            cov_grid[i, j] = len(cell_obs[i][j])
+
+    masked_cov = np.ma.masked_where(cov_grid == 0, cov_grid)
+
+    cmap = plt.cm.plasma.copy()
+    cmap.set_bad(color="#1a1c23")
+
+    im = ax.imshow(
+        masked_cov.T,
+        extent=[bx[0], bx[-1], bz[0], bz[-1]],
+        origin="lower",
+        cmap=cmap,
+        aspect="equal",
+        interpolation="nearest",
+    )
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Distinct Observing Cameras (0.5m cell)", fontsize=10, fontweight="bold")
+
+    # Overlay camera positions with subtle markers
+    if source_cameras:
+        for s_name, s_pts in source_cameras.items():
+            if len(s_pts) > 0:
+                color, _, _ = SOURCE_PALETTE.get(s_name, ("white", "o", s_name))
+                ax.scatter(s_pts[:, 0], s_pts[:, 2], color=color, edgecolor="black", s=10, alpha=0.7, zorder=6)
+
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(bottom=z_max, top=z_min)
+
+    ax.xaxis.set_major_locator(MultipleLocator(1.0))
+    ax.yaxis.set_major_locator(MultipleLocator(1.0))
+    ax.grid(True, linestyle=":", color="gray", alpha=0.6)
+    add_scale_bar(ax, length_m=1.0, label="1 m")
+
+    ax.set_xlabel("X (metres)  [← West (-X), East (+X) →]", fontsize=11, fontweight="bold")
+    ax.set_ylabel("Z (metres)  [↑ North (-Z), South (+Z) ↓]", fontsize=11, fontweight="bold")
+    ax.set_title(f"CAMERA COVERAGE MAP (coverage.png)\n{header_line1}\nDistinct cameras observing points per 0.5m cell", fontsize=9, pad=12)
 
     return fig, ax
 
@@ -543,6 +665,15 @@ def check_alignment(
     z_min_top = z_p1 - 0.5
     z_max_top = z_p99 + 0.5
 
+    # Separate cameras by source
+    source_cameras: Dict[str, List[np.ndarray]] = {}
+    for im, c in zip(sorted_imgs, cam_centers):
+        s_name = get_source_name(im["name"])
+        if s_name not in source_cameras:
+            source_cameras[s_name] = []
+        source_cameras[s_name].append(c)
+    source_cams_np = {k: np.array(v) for k, v in source_cameras.items()}
+
     fig_top, ax_top = plot_top_view(
         cam_centers=cam_centers,
         pts_top=pts_top,
@@ -553,11 +684,30 @@ def check_alignment(
         header_line1=header_line1,
         header_line2=header_line2,
         start_end_gap=start_end_gap,
+        source_cameras=source_cams_np,
     )
     top_png_path = outputs_dir_path / "top.png"
     fig_top.tight_layout()
     fig_top.savefig(str(top_png_path), dpi=150)
     plt.close(fig_top)
+
+    # -----------------------------------------------------------------------
+    # 1b. COVERAGE.PNG (0.5m grid of distinct observing cameras)
+    # -----------------------------------------------------------------------
+    fig_cov, ax_cov = plot_coverage_map(
+        points=points,
+        x_min=x_min_top,
+        x_max=x_max_top,
+        z_min=z_min_top,
+        z_max=z_max_top,
+        header_line1=header_line1,
+        source_cameras=source_cams_np,
+        cell_size=0.5,
+    )
+    cov_png_path = outputs_dir_path / "coverage.png"
+    fig_cov.tight_layout()
+    fig_cov.savefig(str(cov_png_path), dpi=150)
+    plt.close(fig_cov)
 
     # -----------------------------------------------------------------------
     # 2. SIDE_XY.PNG
@@ -578,7 +728,11 @@ def check_alignment(
     ax_xy.plot([x_lim_low, x_lim_high], [ceiling_est, ceiling_est], color="purple", linestyle="--", linewidth=2.0, zorder=8, label=f"Ceiling ({ceiling_est:.2f} m [{ceiling_label}])")
 
     # Cameras
-    if p2_cams is not None and len(p2_cams) > 0:
+    if len(source_cams_np) > 2:
+        for s_name, s_pts in sorted(source_cams_np.items()):
+            color, marker, label = SOURCE_PALETTE.get(s_name, ("dodgerblue", "o", s_name))
+            ax_xy.scatter(s_pts[:, 0], s_pts[:, 1], color=color, marker=marker, s=14, zorder=9, label=f"{label} ({len(s_pts)})")
+    elif p2_cams is not None and len(p2_cams) > 0:
         ax_xy.scatter(p1_cams[:, 0], p1_cams[:, 1], color="dodgerblue", s=14, zorder=9, label=f"Pass 1 Eye ({p1_h_mean:.2f}m)")
         ax_xy.scatter(p2_cams[:, 0], p2_cams[:, 1], color="deeppink", s=14, zorder=9, label=f"Pass 2 Chest ({p2_h_mean:.2f}m)")
     else:
@@ -620,7 +774,11 @@ def check_alignment(
     ax_zy.plot([z_lim_low, z_lim_high], [0.0, 0.0], color="green", linewidth=2.5, zorder=8, label="Floor (y = 0.0 m)")
     ax_zy.plot([z_lim_low, z_lim_high], [ceiling_est, ceiling_est], color="purple", linestyle="--", linewidth=2.0, zorder=8, label=f"Ceiling ({ceiling_est:.2f} m [{ceiling_label}])")
 
-    if p2_cams is not None and len(p2_cams) > 0:
+    if len(source_cams_np) > 2:
+        for s_name, s_pts in sorted(source_cams_np.items()):
+            color, marker, label = SOURCE_PALETTE.get(s_name, ("dodgerblue", "o", s_name))
+            ax_zy.scatter(s_pts[:, 2], s_pts[:, 1], color=color, marker=marker, s=14, zorder=9, label=f"{label} ({len(s_pts)})")
+    elif p2_cams is not None and len(p2_cams) > 0:
         ax_zy.scatter(p1_cams[:, 2], p1_cams[:, 1], color="dodgerblue", s=14, zorder=9, label=f"Pass 1 Eye ({p1_h_mean:.2f}m)")
         ax_zy.scatter(p2_cams[:, 2], p2_cams[:, 1], color="deeppink", s=14, zorder=9, label=f"Pass 2 Chest ({p2_h_mean:.2f}m)")
     else:

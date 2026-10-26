@@ -11,6 +11,7 @@ export interface OccupancyGrid {
   height: number;
   data: number[] | Uint8Array;
   walkable?: number[] | Uint8Array;
+  state?: number[] | Uint8Array;
 }
 
 export interface MoveResult {
@@ -46,17 +47,39 @@ export function worldToCell(
 /**
  * Returns true if the cell (col, row) is blocked (occupied or outside the grid).
  * If limitToWalkable is true and walkable array is provided, unwalkable cells (walkable === 0) are also blocked.
+ * If allowUnknown is true (Explore Mode Key U), movement into unknown cells (state 0) is allowed,
+ * but occupied (state 2) and inflated (state 3) cells remain strictly blocked.
  */
 export function isBlocked(
   grid: OccupancyGrid,
   col: number,
   row: number,
-  limitToWalkable = false
+  limitToWalkable = false,
+  allowUnknown = false
 ): boolean {
   if (col < 0 || col >= grid.width || row < 0 || row >= grid.height) {
     return true; // outside grid is always blocked
   }
   const idx = row * grid.width + col;
+
+  if (grid.state) {
+    const s = grid.state[idx];
+    // Occupied (state 2) and Inflated (state 3) are strictly blocked in both modes
+    if (s === 2 || s === 3) {
+      return true;
+    }
+    // Unknown (state 0): blocked when allowUnknown is false (default), allowed when allowUnknown is true
+    if (s === 0) {
+      return !allowUnknown;
+    }
+    // Free (state 1): allowed; if limitToWalkable is true and allowUnknown is false, check flood fill
+    if (!allowUnknown && limitToWalkable && grid.walkable && grid.walkable[idx] === 0) {
+      return true;
+    }
+    return false;
+  }
+
+  // Fallback when state array is not provided
   if (grid.data[idx] === 1) {
     return true; // occupied cell
   }
@@ -73,11 +96,29 @@ export function isPointBlocked(
   grid: OccupancyGrid,
   x: number,
   z: number,
-  limitToWalkable = false
+  limitToWalkable = false,
+  allowUnknown = false
 ): boolean {
   const col = Math.floor((x - grid.origin[0]) / grid.cell_size);
   const row = Math.floor((z - grid.origin[1]) / grid.cell_size);
-  return isBlocked(grid, col, row, limitToWalkable);
+  return isBlocked(grid, col, row, limitToWalkable, allowUnknown);
+}
+
+/**
+ * Returns true if the world position (x, z) falls in an unknown cell (state 0).
+ */
+export function isPointInUnknownCell(
+  grid: OccupancyGrid,
+  x: number,
+  z: number
+): boolean {
+  if (!grid.state) return false;
+  const col = Math.floor((x - grid.origin[0]) / grid.cell_size);
+  const row = Math.floor((z - grid.origin[1]) / grid.cell_size);
+  if (col < 0 || col >= grid.width || row < 0 || row >= grid.height) {
+    return false;
+  }
+  return grid.state[row * grid.width + col] === 0;
 }
 
 /**
@@ -90,7 +131,8 @@ export function isCircleBlocked(
   cx: number,
   cz: number,
   radius: number,
-  limitToWalkable = false
+  limitToWalkable = false,
+  allowUnknown = false
 ): boolean {
   const originX = grid.origin[0];
   const originZ = grid.origin[1];
@@ -105,7 +147,7 @@ export function isCircleBlocked(
 
   for (let row = minRow; row <= maxRow; row++) {
     for (let col = minCol; col <= maxCol; col++) {
-      if (isBlocked(grid, col, row, limitToWalkable)) {
+      if (isBlocked(grid, col, row, limitToWalkable, allowUnknown)) {
         // Find nearest point on cell (col, row) to circle centre (cx, cz)
         const cellMinX = originX + col * cellSize;
         const cellMaxX = cellMinX + cellSize;
@@ -136,9 +178,10 @@ export function getDistanceToFree(
   x: number,
   z: number,
   limitToWalkable = false,
+  allowUnknown = false,
   maxSearchRings = 25
 ): number {
-  if (!isPointBlocked(grid, x, z, limitToWalkable)) {
+  if (!isPointBlocked(grid, x, z, limitToWalkable, allowUnknown)) {
     return 0;
   }
 
@@ -165,7 +208,7 @@ export function getDistanceToFree(
           continue;
         }
 
-        if (!isBlocked(grid, c, r, limitToWalkable)) {
+        if (!isBlocked(grid, c, r, limitToWalkable, allowUnknown)) {
           foundFree = true;
           const cellMinX = originX + c * cellSize;
           const cellMaxX = cellMinX + cellSize;
@@ -205,16 +248,17 @@ export function isMoveAllowed(
   toX: number,
   toZ: number,
   radius: number,
-  limitToWalkable = false
+  limitToWalkable = false,
+  allowUnknown = false
 ): boolean {
-  if (!isCircleBlocked(grid, toX, toZ, radius, limitToWalkable)) {
+  if (!isCircleBlocked(grid, toX, toZ, radius, limitToWalkable, allowUnknown)) {
     return true;
   }
 
   // Stuck escape: if already blocked, allow moves that move towards or maintain distance to free space
-  if (isCircleBlocked(grid, fromX, fromZ, radius, limitToWalkable)) {
-    const fromDist = getDistanceToFree(grid, fromX, fromZ, limitToWalkable);
-    const toDist = getDistanceToFree(grid, toX, toZ, limitToWalkable);
+  if (isCircleBlocked(grid, fromX, fromZ, radius, limitToWalkable, allowUnknown)) {
+    const fromDist = getDistanceToFree(grid, fromX, fromZ, limitToWalkable, allowUnknown);
+    const toDist = getDistanceToFree(grid, toX, toZ, limitToWalkable, allowUnknown);
     return toDist <= fromDist + 1e-5;
   }
 
@@ -235,8 +279,17 @@ export function resolveMovement(
   dz: number,
   radius: number,
   limitToWalkable = false,
-  outResult?: MoveResult
+  allowUnknownOrOut?: boolean | MoveResult,
+  maybeOutResult?: MoveResult
 ): MoveResult {
+  let allowUnknown = false;
+  let outResult: MoveResult | undefined = maybeOutResult;
+  if (typeof allowUnknownOrOut === "boolean") {
+    allowUnknown = allowUnknownOrOut;
+  } else if (allowUnknownOrOut && typeof allowUnknownOrOut === "object") {
+    outResult = allowUnknownOrOut;
+  }
+
   const result: MoveResult = outResult ?? { x: curX, z: curZ, hitX: false, hitZ: false };
   result.x = curX;
   result.z = curZ;
@@ -258,13 +311,13 @@ export function resolveMovement(
     const targetZ = result.z + stepDz;
 
     // 1. Try full diagonal move
-    if (isMoveAllowed(grid, result.x, result.z, targetX, targetZ, radius, limitToWalkable)) {
+    if (isMoveAllowed(grid, result.x, result.z, targetX, targetZ, radius, limitToWalkable, allowUnknown)) {
       result.x = targetX;
       result.z = targetZ;
     } else {
       // 2. Full move blocked: Try sliding along X or Z
-      const canX = stepDx !== 0 && isMoveAllowed(grid, result.x, result.z, targetX, result.z, radius, limitToWalkable);
-      const canZ = stepDz !== 0 && isMoveAllowed(grid, result.x, result.z, result.x, targetZ, radius, limitToWalkable);
+      const canX = stepDx !== 0 && isMoveAllowed(grid, result.x, result.z, targetX, result.z, radius, limitToWalkable, allowUnknown);
+      const canZ = stepDz !== 0 && isMoveAllowed(grid, result.x, result.z, result.x, targetZ, radius, limitToWalkable, allowUnknown);
 
       if (canX && !canZ) {
         result.x = targetX;

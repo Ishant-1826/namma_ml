@@ -67,6 +67,39 @@ html, body {
   display: block;
 }
 
+/* Unreconstructed Area HUD Label (Key U Explore Mode) */
+.hud-unreconstructed {
+  position: fixed;
+  bottom: 32px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(234, 88, 12, 0.88); /* Vibrant amber alert */
+  color: #ffffff;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 6px 14px;
+  border-radius: 9999px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5), 0 0 12px rgba(234, 88, 12, 0.4);
+  pointer-events: none;
+  z-index: 30;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  animation: hudPulse 2s ease-in-out infinite;
+}
+
+.hud-unreconstructed.hidden {
+  display: none;
+}
+
+@keyframes hudPulse {
+  0%, 100% { opacity: 0.92; }
+  50% { opacity: 1.0; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.6), 0 0 18px rgba(234, 88, 12, 0.6); }
+}
+
 /* F3 Telemetry & Stats Panel */
 #stats-panel {
   position: absolute;

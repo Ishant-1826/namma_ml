@@ -447,10 +447,10 @@ def verify_splat_frame(
 
         # Coverage Rule
         if ax in ["X", "Z"]:
-            # (a) Ref box lies inside filtered-splat box with 0.3 m tolerance:
+            # (a) Ref box lies inside filtered-splat box within corner tolerance:
             underhang_min = float(p2_filt[i] - p2_ref[i])
             underhang_max = float(p98_ref[i] - p98_filt[i])
-            inside_ok = (underhang_min <= 0.30) and (underhang_max <= 0.30)
+            inside_ok = (underhang_min <= corner_tolerance_m) and (underhang_max <= corner_tolerance_m)
 
             # (b) Filtered-splat box exceeds reference box by at most 1.0 m:
             overhang_min = float(p2_ref[i] - p2_filt[i])
@@ -463,7 +463,7 @@ def verify_splat_frame(
                 new_extents_passed = False
                 if not inside_ok:
                     failure_reasons.append(
-                        f"{ax} box does not enclose reference box within 0.30m tolerance "
+                        f"{ax} box does not enclose reference box within {corner_tolerance_m:.2f}m tolerance "
                         f"(underhang_min={underhang_min:+.2f}m, underhang_max={underhang_max:+.2f}m)"
                     )
                 if not exceed_ok:

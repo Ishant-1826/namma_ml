@@ -1,0 +1,10 @@
+{
+  "name": "namma-space-workspace",
+  "private": true,
+  "scripts": {
+    "dev": "npm --prefix viewer run dev",
+    "build": "npm --prefix viewer run build",
+    "test": "npm --prefix viewer run test",
+    "preview": "npm --prefix viewer run preview"
+  }
+}

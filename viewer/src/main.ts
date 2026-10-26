@@ -1,7 +1,7 @@
 import * as THREE from "three";
 import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
 import { FirstPersonControls, EYE_HEIGHT_M } from "./controls";
-import { OccupancyGrid, SceneBounds } from "./collision";
+import { OccupancyGrid, SceneBounds, isPointInUnknownCell } from "./collision";
 import { Minimap } from "./minimap";
 
 // Asset base from Vite env (default empty = same origin)
@@ -90,6 +90,7 @@ function saveQuality(quality: QualityTier): void {
 // DOM Elements
 const canvasContainer = document.getElementById("canvas-container") as HTMLDivElement;
 const crosshair = document.getElementById("crosshair") as HTMLDivElement;
+const hudUnreconstructed = document.getElementById("hud-unreconstructed") as HTMLDivElement;
 const minimapContainer = document.getElementById("minimap-container") as HTMLDivElement;
 const joystickContainer = document.getElementById("joystick-container") as HTMLDivElement;
 const joystickThumb = document.getElementById("joystick-thumb") as HTMLDivElement;
@@ -117,6 +118,7 @@ const statsWalkableVal = document.getElementById("stats-walkable") as HTMLSpanEl
 const statsCollisionVal = document.getElementById("stats-collision") as HTMLSpanElement;
 const statsHeadbobVal = document.getElementById("stats-headbob") as HTMLSpanElement;
 const statsMinimapVal = document.getElementById("stats-minimap") as HTMLSpanElement;
+const statsExploreVal = document.getElementById("stats-explore") as HTMLSpanElement;
 
 const loadingOverlay = document.getElementById("loading-overlay") as HTMLDivElement;
 const loadingSubtitle = document.getElementById("loading-subtitle") as HTMLDivElement;
@@ -244,8 +246,14 @@ function initGraphics() {
   renderer.setSize(window.innerWidth, window.innerHeight);
   canvasContainer.replaceChildren(renderer.domElement);
 
-  // SparkRenderer integration into Three.js scene
-  spark = new SparkRenderer({ renderer });
+  // SparkRenderer integration into Three.js scene with quality presets
+  const initialQuality = QUALITY_PRESETS[activeQualityTier];
+  spark = new SparkRenderer({
+    renderer,
+    maxStdDev: initialQuality.sparkMaxStdDev,
+    lodSplatScale: initialQuality.sparkLodSplatScale,
+    lodRenderScale: initialQuality.sparkLodRenderScale,
+  });
   scene.add(spark);
 
   // Minimap initialization
@@ -268,6 +276,9 @@ function initGraphics() {
   };
   controls.onWalkableLimitChange = (enabled) => {
     statsWalkableVal.textContent = enabled ? "ON" : "OFF";
+  };
+  controls.onExploreUnknownChange = (enabled) => {
+    statsExploreVal.textContent = enabled ? "ON (Key U)" : "OFF (Key U)";
   };
 
   // Lock / touch state listener: toggle overlay & crosshair
@@ -348,6 +359,8 @@ function initGraphics() {
     } else if (e.code === "KeyL") {
       const limit = controls.toggleWalkableLimit();
       statsWalkableVal.textContent = limit ? "ON" : "OFF";
+    } else if (e.code === "KeyU") {
+      statsExploreVal.textContent = controls.exploreUnknown ? "ON (Key U)" : "OFF (Key U)";
     } else if (e.code === "F3" || e.key === "F3") {
       e.preventDefault();
       statsPanelVisible = !statsPanelVisible;
@@ -380,6 +393,18 @@ function initGraphics() {
 
     controls.update(dt);
     renderer.render(scene, camera);
+
+    // Update unreconstructed area HUD badge (Key U Explore Mode)
+    if (controls.exploreUnknown && currentOccupancy) {
+      const inUnknown = isPointInUnknownCell(
+        currentOccupancy,
+        camera.position.x,
+        camera.position.z
+      );
+      hudUnreconstructed.classList.toggle("hidden", !inUnknown);
+    } else {
+      hudUnreconstructed.classList.add("hidden");
+    }
 
     // Update minimap player heading and dot at most 10 times per second
     minimap.update(camera.position.x, camera.position.z, controls.currentYawRad, now);
@@ -419,6 +444,7 @@ function updateStatsDOM(): void {
   statsCollisionVal.textContent = currentOccupancy ? `ON (r=${controls.playerRadius}m)` : "OFF";
   statsHeadbobVal.textContent = controls.headBobEnabled ? "ON (Key H)" : "OFF (Key H)";
   statsMinimapVal.textContent = minimap.isVisible ? "ON (Key B)" : "OFF (Key B)";
+  statsExploreVal.textContent = controls.exploreUnknown ? "ON (Key U)" : "OFF (Key U)";
 }
 
 // Fetch Manifest, Load Occupancy Grid, and Load Splat Assets

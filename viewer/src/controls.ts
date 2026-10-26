@@ -200,6 +200,7 @@ export class FirstPersonControls {
 
   public limitToWalkable: boolean;
   public headBobEnabled = false;
+  public exploreUnknown = false;
 
   private _fixedEyeHeight = EYE_HEIGHT_M;
   private _spawnPosition = new THREE.Vector3(0, EYE_HEIGHT_M, 0);
@@ -242,6 +243,7 @@ export class FirstPersonControls {
   public onLockChange?: (locked: boolean) => void;
   public onHeadBobChange?: (enabled: boolean) => void;
   public onWalkableLimitChange?: (enabled: boolean) => void;
+  public onExploreUnknownChange?: (enabled: boolean) => void;
 
   // Bound event handlers for clean teardown
   private readonly _onMouseMove: (e: MouseEvent) => void;
@@ -332,6 +334,9 @@ export class FirstPersonControls {
           break;
         case "KeyH":
           this.toggleHeadBob();
+          break;
+        case "KeyU":
+          this.toggleExploreUnknown();
           break;
       }
     };
@@ -538,6 +543,12 @@ export class FirstPersonControls {
     return this.limitToWalkable;
   }
 
+  toggleExploreUnknown(): boolean {
+    this.exploreUnknown = !this.exploreUnknown;
+    this.onExploreUnknownChange?.(this.exploreUnknown);
+    return this.exploreUnknown;
+  }
+
   startTouchSession(): void {
     this._isLocked = true;
     this.onLockChange?.(true);
@@ -646,6 +657,7 @@ export class FirstPersonControls {
         dz,
         this.playerRadius,
         this.limitToWalkable,
+        this.exploreUnknown,
         this._moveResult
       );
 

@@ -127,6 +127,112 @@ def rodrigues_align(v_src: np.ndarray, v_dst: np.ndarray) -> np.ndarray:
     return R
 
 
+def rdp_simplify(points: np.ndarray, epsilon: float = 1.0) -> np.ndarray:
+    """Ramer-Douglas-Peucker 2D polyline simplification."""
+    if len(points) < 3:
+        return points
+
+    p1 = points[0]
+    p2 = points[-1]
+    line_vec = p2 - p1
+    line_len = np.linalg.norm(line_vec)
+
+    if line_len < 1e-8:
+        dists = [float(np.linalg.norm(p - p1)) for p in points]
+    else:
+        line_unit = line_vec / line_len
+        dists = []
+        for p in points:
+            v = p - p1
+            proj = np.dot(v, line_unit)
+            perp = v - proj * line_unit
+            dists.append(float(np.linalg.norm(perp)))
+
+    dmax = max(dists)
+    index = int(np.argmax(dists))
+
+    if dmax > epsilon:
+        rec1 = rdp_simplify(points[: index + 1], epsilon)
+        rec2 = rdp_simplify(points[index:], epsilon)
+        return np.vstack((rec1[:-1], rec2))
+    else:
+        return np.array([points[0], points[-1]])
+
+
+def compute_turn_sequence_and_corners(
+    path_xz: np.ndarray,
+    smooth_window: int = 5,
+    rdp_epsilon: float = 1.0,
+    min_leg_length: float = 1.0,
+) -> Tuple[List[str], int, np.ndarray]:
+    """
+    Compute turn sequence ('L'/'R') and corner count:
+    1. Smooth the camera path with a 5-frame moving average.
+    2. Simplify via Ramer-Douglas-Peucker at 1.0 m.
+    3. Merge legs shorter than 1.0 m.
+    4. Compute L/R sequence and corner count.
+    path_xz: (N, 2) [X, Z]. Converted to [X, -Z] where North is up.
+    """
+    if len(path_xz) < 3:
+        return [], 0, path_xz
+
+    path_topdown = np.column_stack([path_xz[:, 0], -path_xz[:, 1]])
+
+    if len(path_topdown) >= smooth_window:
+        pad_w = smooth_window // 2
+        padded = np.pad(path_topdown, ((pad_w, pad_w), (0, 0)), mode="edge")
+        kernel = np.ones(smooth_window) / float(smooth_window)
+        smoothed = np.column_stack([
+            np.convolve(padded[:, 0], kernel, mode="valid"),
+            np.convolve(padded[:, 1], kernel, mode="valid"),
+        ])
+    else:
+        smoothed = path_topdown.copy()
+
+    simplified = rdp_simplify(smoothed, epsilon=rdp_epsilon)
+
+    pts = list(simplified)
+    changed = True
+    while changed and len(pts) > 2:
+        changed = False
+        for i in range(len(pts) - 1):
+            leg_len = float(np.linalg.norm(pts[i + 1] - pts[i]))
+            if leg_len < min_leg_length:
+                if i < len(pts) - 2:
+                    pts.pop(i + 1)
+                else:
+                    pts.pop(i)
+                changed = True
+                break
+
+    merged_poly = np.array(pts)
+
+    turns = []
+    for i in range(1, len(merged_poly) - 1):
+        v1 = merged_poly[i] - merged_poly[i - 1]
+        v2 = merged_poly[i + 1] - merged_poly[i]
+        cross = v1[0] * v2[1] - v1[1] * v2[0]
+        if abs(cross) > 1e-4:
+            turns.append("L" if cross > 0 else "R")
+
+    corner_count = len(turns)
+    return turns, corner_count, merged_poly
+
+
+def get_source_name(name: str) -> str:
+    """Extract source folder name from image path."""
+    norm_name = name.replace("\\", "/")
+    parts = norm_name.split("/")
+    if len(parts) > 1:
+        return parts[0]
+    nl = name.lower()
+    if "video1" in nl:
+        return "video1"
+    if "video2" in nl:
+        return "video2"
+    return "source"
+
+
 def parse_cameras_txt(path: Path) -> Dict[int, dict]:
     cameras = {}
     with open(path, "r", encoding="utf-8") as f:
@@ -843,37 +949,36 @@ def align_scene(
     # -----------------------------------------------------------------------
     # STEP 5: SCALE
     # -----------------------------------------------------------------------
-    print("\n[STEP 5] Metric scale recovery...")
-    # Determine passes / videos
-    # Pass 1: video1 or frames 1..pass_split
-    # Pass 2: video2 or frames > pass_split
-    pass_split = 222
-    frames_rep_path = data_dir / "frames_report.json"
-    if frames_rep_path.is_file():
-        try:
-            with open(frames_rep_path, "r", encoding="utf-8") as fr_f:
-                vids = json.load(fr_f).get("videos", [])
-                if vids:
-                    pass_split = vids[0].get("kept_after_duplicate", vids[0].get("raw_extracted", 222))
-        except Exception:
-            pass
-
-    # Separate camera heights by pass
-    p1_cams_unscaled = []
-    p2_cams_unscaled = []
+    print("\n[STEP 5] Metric scale recovery (generalised to per-source)...")
+    # Group registered cameras by source
+    source_cams_unscaled: Dict[str, List[float]] = {}
+    source_centers_unscaled: Dict[str, List[np.ndarray]] = {}
+    source_images: Dict[str, List[dict]] = {}
 
     for im in images.values():
+        s_name = get_source_name(im["name"])
         C = camera_centre(im)
-        name = im["name"].lower()
-        f_num = frame_number(name)
-        if "video2" in name or ("video1" not in name and f_num > pass_split):
-            p2_cams_unscaled.append(C[1])
-        else:
-            p1_cams_unscaled.append(C[1])
+        if s_name not in source_cams_unscaled:
+            source_cams_unscaled[s_name] = []
+            source_centers_unscaled[s_name] = []
+            source_images[s_name] = []
+        source_cams_unscaled[s_name].append(float(C[1]))
+        source_centers_unscaled[s_name].append(C)
+        source_images[s_name].append(im)
 
-    mean_p1_unscaled = float(np.mean(p1_cams_unscaled)) if p1_cams_unscaled else float(np.mean([camera_centre(im)[1] for im in images.values()]))
-    mean_p2_unscaled = float(np.mean(p2_cams_unscaled)) if p2_cams_unscaled else mean_p1_unscaled
+    # Identify eye-level reference pass (default 1.45m)
+    ref_source = None
+    for s_cand in ["20261021_195555", "video1", "pass1", "eye"]:
+        for s_name in source_cams_unscaled:
+            if s_cand in s_name.lower():
+                ref_source = s_name
+                break
+        if ref_source:
+            break
+    if not ref_source:
+        ref_source = sorted(source_cams_unscaled.keys())[0]
 
+    mean_ref_unscaled = float(np.mean(source_cams_unscaled[ref_source])) if source_cams_unscaled[ref_source] else 1.0
     target_eye_h = float(align_cfg.get("eye_level_height_m", 1.45))
     target_chest_h = float(align_cfg.get("chest_level_height_m", 1.15))
 
@@ -906,10 +1011,10 @@ def align_scene(
         s = known_distance / dist_u
         print(f"  Mode (a) Point Coordinates: dist = {dist_u:.4f} u, target = {known_distance:.3f} m -> Scale = {s:.5f} m/u")
     else:
-        # Mode (b) Default: scale so eye level = 1.45 m
+        # Mode (b) Default: scale so reference eye level pass = 1.45 m
         scale_method = "phone_height"
-        s = target_eye_h / mean_p1_unscaled if abs(mean_p1_unscaled) > 1e-4 else 1.0
-        print(f"  Mode (b) Reference: Eye level unscaled = {mean_p1_unscaled:.4f} u, Target = {target_eye_h:.2f} m -> Scale = {s:.5f} m/u")
+        s = target_eye_h / mean_ref_unscaled if abs(mean_ref_unscaled) > 1e-4 else 1.0
+        print(f"  Mode (b) Reference [{ref_source}]: Eye level unscaled = {mean_ref_unscaled:.4f} u, Target = {target_eye_h:.2f} m -> Scale = {s:.5f} m/u")
 
     # Apply uniform scale to points and cameras
     for pt in points.values():
@@ -920,18 +1025,67 @@ def align_scene(
         im["ty"] *= s
         im["tz"] *= s
 
-    # Per-pass heights before and after
-    mean_p1_scaled = mean_p1_unscaled * s
-    mean_p2_scaled = mean_p2_unscaled * s
-    ratio_scaled = mean_p1_scaled / mean_p2_scaled if mean_p2_scaled > 1e-4 else 1.0
+    # Per-source height calculation and reporting
+    print("\n" + "=" * 80)
+    print("  PER-SOURCE CAMERA HEIGHT REPORT")
+    print("=" * 80)
+    print(f"  {'Source':<24} {'Cameras':<10} {'Unscaled (u)':<16} {'Scaled (m)':<14} {'Std Dev (m)':<14} {'Role'}")
+    print("  " + "-" * 78)
+    per_source_heights = {}
+    p1_scaled_val = target_eye_h
+    p2_scaled_val = None
 
-    print("\n  Per-Pass Camera Heights:")
-    print(f"    Pass 1 (Eye level)   : Before = {mean_p1_unscaled:.4f} u, After = {mean_p1_scaled:.3f} m (Reference: {target_eye_h:.2f} m)")
-    if p2_cams_unscaled:
-        print(f"    Pass 2 (Chest level) : Before = {mean_p2_unscaled:.4f} u, After = {mean_p2_scaled:.3f} m (Check: {target_chest_h:.2f} m)")
-        print(f"    Eye / Chest Ratio    : {ratio_scaled:.2f}x")
-        if not (1.10 <= ratio_scaled <= 1.50):
-            print(f"    [WARNING] Eye/chest height ratio ({ratio_scaled:.2f}) is not between 1.1 and 1.5!")
+    for s_name in sorted(source_cams_unscaled.keys()):
+        unscaled_vals = np.array(source_cams_unscaled[s_name])
+        scaled_vals = unscaled_vals * s
+        m_u = float(np.mean(unscaled_vals))
+        m_s = float(np.mean(scaled_vals))
+        std_s = float(np.std(scaled_vals))
+        if s_name == ref_source:
+            role = f"Scale Reference ({target_eye_h:.2f}m)"
+            p1_scaled_val = m_s
+        elif "195930" in s_name or "video2" in s_name or "chest" in s_name.lower():
+            role = f"Chest Pass Check ({target_chest_h:.2f}m)"
+            p2_scaled_val = m_s
+        else:
+            role = "New Source (Reported)"
+        per_source_heights[s_name] = {
+            "num_cameras": len(unscaled_vals),
+            "unscaled_mean_u": round(m_u, 4),
+            "scaled_mean_m": round(m_s, 3),
+            "scaled_std_m": round(std_s, 3),
+            "role": role,
+        }
+        print(f"  {s_name:<24} {len(unscaled_vals):<10} {m_u:<16.4f} {m_s:<14.3f} {std_s:<14.3f} {role}")
+    print("  " + "-" * 78)
+
+    ratio_scaled = (p1_scaled_val / p2_scaled_val) if (p2_scaled_val and p2_scaled_val > 1e-4) else 1.0
+    if p2_scaled_val:
+        print(f"  Eye / Chest Height Ratio : {ratio_scaled:.2f}x ({'PASS [1.10 - 1.50x]' if 1.10 <= ratio_scaled <= 1.50 else 'WARNING out of range'})")
+
+    # Start-to-end gap and turn sequence of original passes
+    print("\n" + "-" * 80)
+    print("  ORIGINAL PASSES: START-TO-END GAP & TURN SEQUENCE")
+    print("-" * 80)
+    orig_sources = [s for s in sorted(source_cams_unscaled.keys()) if "20261021_" in s or "video" in s.lower() or s == ref_source]
+    orig_pass_metrics = {}
+    for os_name in orig_sources:
+        os_imgs = source_images[os_name]
+        os_imgs_sorted = sorted(os_imgs, key=lambda x: frame_number(x["name"]))
+        os_centers = np.array([camera_centre(im) for im in os_imgs_sorted])
+        if len(os_centers) >= 2:
+            gap = float(np.linalg.norm(os_centers[-1] - os_centers[0]))
+            turns, corners, _ = compute_turn_sequence_and_corners(os_centers[:, [0, 2]], smooth_window=5, rdp_epsilon=1.0, min_leg_length=1.0)
+            orig_pass_metrics[os_name] = {
+                "start_end_gap_m": round(gap, 4),
+                "start_xz": [round(float(x), 3) for x in os_centers[0, [0, 2]]],
+                "end_xz": [round(float(x), 3) for x in os_centers[-1, [0, 2]]],
+                "turn_sequence": turns,
+                "corner_count": corners,
+            }
+            print(f"  [{os_name}] Start-to-End Gap : {gap:.4f} m (Start: {os_centers[0, [0,2]]}, End: {os_centers[-1, [0,2]]})")
+            print(f"  [{os_name}] Turn Sequence    : {turns} ({corners} corners)")
+    print("-" * 80)
 
     # Room extents and ceiling height (robust point filtering: track length >= 4, error <= 1.0 px)
     filtered_pts = []
@@ -1050,10 +1204,13 @@ def align_scene(
             "angle_to_up_deg": round(chosen_plane["angle_to_up"], 2),
         },
         "per_pass_heights_m": {
-            "pass_1_eye": round(mean_p1_scaled, 3),
-            "pass_2_chest": round(mean_p2_scaled, 3) if p2_cams_unscaled else None,
+            "pass_1_eye": round(p1_scaled_val, 3),
+            "pass_2_chest": round(p2_scaled_val, 3) if p2_scaled_val else None,
             "ratio": round(ratio_scaled, 2),
         },
+        "per_source_heights": per_source_heights,
+        "scale_reference_source": ref_source,
+        "original_pass_metrics": orig_pass_metrics,
         "camera_footprint_m": {
             "width_x": round(cam_footprint_x, 3),
             "length_z": round(cam_footprint_z, 3),

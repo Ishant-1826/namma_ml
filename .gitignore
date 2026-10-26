@@ -34,6 +34,9 @@ Thumbs.db
 
 # === Misc ===
 *.log
+*.task
+*.done
+*.pid
 *.mp4
 *.mov
 *.avi
@@ -43,4 +46,5 @@ Thumbs.db
 *.ply
 *.splat
 *.spz
+
 

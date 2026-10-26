@@ -6,6 +6,7 @@ import {
   worldToCell,
   isBlocked,
   isPointBlocked,
+  isPointInUnknownCell,
   isCircleBlocked,
   resolveMovement,
   fixSpawnPosition,
@@ -21,7 +22,8 @@ function createSyntheticGrid(
   width: number,
   height: number,
   occupiedCells: Array<[number, number]> = [],
-  unwalkableCells: Array<[number, number]> = []
+  unwalkableCells: Array<[number, number]> = [],
+  cellStates?: Uint8Array
 ): OccupancyGrid {
   const data = new Uint8Array(width * height);
   for (const [col, row] of occupiedCells) {
@@ -46,6 +48,7 @@ function createSyntheticGrid(
     height,
     data,
     walkable,
+    state: cellStates,
   };
 }
 
@@ -323,6 +326,120 @@ describe("Phase 8 Collision Detection & Sliding Maths", () => {
           "[Test Skip] scene.json does not contain recorded camera_positions array; skipped camera trajectory interpolation test."
         );
       }
+    });
+  });
+
+  describe("12. Explore Mode (Key U) Collision Behaviour", () => {
+    // 6x5 grid:
+    // col 0..1: Free cells (state = 1, data = 0)
+    // col 2..3: Unknown cells (state = 0, data = 1)
+    // col 4: Occupied cells (state = 2, data = 1)
+    // col 5: Inflated cells (state = 3, data = 1)
+    const width = 6;
+    const height = 5;
+    const state = new Uint8Array(width * height);
+    const data = new Uint8Array(width * height);
+    const walkable = new Uint8Array(width * height);
+
+    for (let r = 0; r < height; r++) {
+      for (let c = 0; c < width; c++) {
+        const idx = r * width + c;
+        if (c <= 1) {
+          state[idx] = 1; // free
+          data[idx] = 0;
+          walkable[idx] = 1;
+        } else if (c <= 3) {
+          state[idx] = 0; // unknown
+          data[idx] = 1;
+          walkable[idx] = 0;
+        } else if (c === 4) {
+          state[idx] = 2; // occupied
+          data[idx] = 1;
+          walkable[idx] = 0;
+        } else {
+          state[idx] = 3; // inflated
+          data[idx] = 1;
+          walkable[idx] = 0;
+        }
+      }
+    }
+
+    const grid: OccupancyGrid = {
+      origin: [0, 0],
+      cell_size: 0.1,
+      width,
+      height,
+      data,
+      walkable,
+      state,
+    };
+
+    it("blocks unknown cells (state 0) when Explore Mode is OFF (default)", () => {
+      // Cell (col=2, row=2) is unknown (state 0)
+      expect(isBlocked(grid, 2, 2, false, false)).toBe(true);
+      expect(isPointBlocked(grid, 0.25, 0.25, false, false)).toBe(true);
+    });
+
+    it("allows unknown cells (state 0) when Explore Mode is ON", () => {
+      // Cell (col=2, row=2) is unknown (state 0)
+      expect(isBlocked(grid, 2, 2, false, true)).toBe(false);
+      expect(isPointBlocked(grid, 0.25, 0.25, false, true)).toBe(false);
+    });
+
+    it("strictly blocks occupied cells (state 2) in BOTH Explore OFF and Explore ON", () => {
+      // Cell (col=4, row=2) is occupied (state 2)
+      expect(isBlocked(grid, 4, 2, false, false)).toBe(true);
+      expect(isBlocked(grid, 4, 2, false, true)).toBe(true);
+      expect(isPointBlocked(grid, 0.45, 0.25, false, false)).toBe(true);
+      expect(isPointBlocked(grid, 0.45, 0.25, false, true)).toBe(true);
+    });
+
+    it("strictly blocks inflated cells (state 3) in BOTH Explore OFF and Explore ON", () => {
+      // Cell (col=5, row=2) is inflated (state 3)
+      expect(isBlocked(grid, 5, 2, false, false)).toBe(true);
+      expect(isBlocked(grid, 5, 2, false, true)).toBe(true);
+      expect(isPointBlocked(grid, 0.55, 0.25, false, false)).toBe(true);
+      expect(isPointBlocked(grid, 0.55, 0.25, false, true)).toBe(true);
+    });
+
+    it("allows free cells (state 1) in both modes", () => {
+      // Cell (col=0, row=2) is free (state 1)
+      expect(isBlocked(grid, 0, 2, false, false)).toBe(false);
+      expect(isBlocked(grid, 0, 2, false, true)).toBe(false);
+      expect(isPointBlocked(grid, 0.05, 0.25, false, false)).toBe(false);
+      expect(isPointBlocked(grid, 0.05, 0.25, false, true)).toBe(false);
+    });
+
+    it("resolves movement into unknown cell: blocked when OFF, allowed when ON", () => {
+      // Start at free cell x = 0.05, z = 0.25 (col 0, row 2)
+      // Cell 2 (unknown) starts at x = 0.20. With radius 0.08, player cannot cross x = 0.12.
+      // When OFF: player cannot cross into unknown cell
+      const resOff = resolveMovement(grid, 0.05, 0.25, 0.20, 0.0, RADIUS, false, false);
+      expect(resOff.hitX).toBe(true);
+      expect(resOff.x).toBeLessThanOrEqual(0.1201);
+
+      // When ON: player smoothly enters unknown cell towards x = 0.25
+      const resOn = resolveMovement(grid, 0.05, 0.25, 0.20, 0.0, RADIUS, false, true);
+      expect(resOn.x).toBeCloseTo(0.25, 2);
+    });
+
+    it("resolves movement into occupied cell: blocked in both modes", () => {
+      // Start inside unknown cell at x = 0.25, z = 0.25 with Explore ON
+      // Occupied cell begins at x = 0.40. With radius 0.08, player cannot cross x = 0.32.
+      const resIntoOcc = resolveMovement(grid, 0.25, 0.25, 0.20, 0.0, RADIUS, false, true);
+      expect(resIntoOcc.hitX).toBe(true);
+      expect(resIntoOcc.x).toBeLessThanOrEqual(0.3201);
+    });
+
+    it("detects unknown cells accurately via isPointInUnknownCell", () => {
+      // (0.05, 0.25) is free -> false
+      expect(isPointInUnknownCell(grid, 0.05, 0.25)).toBe(false);
+      // (0.25, 0.25) is unknown -> true
+      expect(isPointInUnknownCell(grid, 0.25, 0.25)).toBe(true);
+      // (0.45, 0.25) is occupied -> false
+      expect(isPointInUnknownCell(grid, 0.45, 0.25)).toBe(false);
+      // Outside grid -> false
+      expect(isPointInUnknownCell(grid, -1.0, 0.25)).toBe(false);
     });
   });
 });

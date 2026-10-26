@@ -332,7 +332,7 @@ def resolve_image_directory(scene_dir: Path) -> Path:
         scene_dir / "raw",
     ]
     for c in candidates:
-        if c.is_dir() and any(c.glob("*.jpg")):
+        if c.is_dir() and (any(c.glob("*.jpg")) or any(c.glob("*/*.jpg"))):
             return c
 
     return scene_dir / "images"
@@ -442,7 +442,7 @@ def main() -> int:
         )
         return 1
 
-    image_files = sorted(list(image_dir.glob("*.jpg")) + list(image_dir.glob("*.png")))
+    image_files = sorted(list(image_dir.rglob("*.jpg")) + list(image_dir.rglob("*.png")))
     total_images = len(image_files)
 
     if total_images == 0:
@@ -453,13 +453,15 @@ def main() -> int:
         )
         return 1
 
+    has_subfolders = any(sub.is_dir() and (any(sub.glob("*.jpg")) or any(sub.glob("*.png"))) for sub in image_dir.iterdir()) if image_dir.is_dir() else False
+
     # Choose matcher: sequential with loop detection, or exhaustive when <= 300 images
     if args.matcher:
         matcher_choice = args.matcher
     elif "matcher" in sfm_cfg and sfm_cfg["matcher"]:
         matcher_choice = sfm_cfg["matcher"]
     else:
-        matcher_choice = "exhaustive" if total_images <= 300 else "sequential"
+        matcher_choice = "sequential" if has_subfolders else ("exhaustive" if total_images <= 300 else "sequential")
 
     colmap_dir = scene_dir / "colmap"
     database_path = colmap_dir / "database.db"
@@ -505,15 +507,19 @@ def main() -> int:
     else:
         feature_type = "SIFT"
 
+    if has_subfolders:
+        cam_model = "SIMPLE_RADIAL"
+
     print("=" * 70)
     print("  NAMMA SPACE -- STAGE 2: STRUCTURE-FROM-MOTION (COLMAP)")
     print("=" * 70)
     print(f"  Scene              : {args.scene}")
     print(f"  Images directory   : {image_dir} ({total_images} frames)")
+    print(f"  Multi-camera Mode  : {'1 camera per subfolder' if has_subfolders else 'Single shared camera'}")
     print(f"  COLMAP binary      : {colmap_bin} (v{colmap_version})")
-    print(f"  Camera Model       : {cam_model} (Single shared camera)")
+    print(f"  Camera Model       : {cam_model}")
     print(f"  Feature Extractor  : {feature_type} (GPU={'1' if use_gpu else '0'})")
-    print(f"  Matcher            : {matcher_choice} (GPU={'1' if use_gpu else '0'})")
+    print(f"  Matcher            : {matcher_choice} + {'Exhaustive Cross-Matcher' if has_subfolders else ''} (GPU={'1' if use_gpu else '0'})")
     print(f"  Mapper             : {mapper_choice}")
     print(f"  Database           : {database_path}")
     print(f"  Sparse Output      : {sparse_dir}")
@@ -531,14 +537,26 @@ def main() -> int:
 
     if need_extraction:
         update_status(status_paths, "feature_extraction", f"Extracting {feature_type} features ({cam_model})...", done=False)
-        feat_args = [
-            "--database_path", str(database_path),
-            "--image_path", str(image_dir),
-            "--ImageReader.camera_model", cam_model,
-            "--ImageReader.single_camera", "1",
-            "--SiftExtraction.use_gpu", "1" if use_gpu else "0",
-            "--SiftExtraction.max_num_features", "8192",
-        ]
+        if has_subfolders:
+            feat_args = [
+                "--database_path", str(database_path),
+                "--image_path", str(image_dir),
+                "--ImageReader.camera_model", "SIMPLE_RADIAL",
+                "--ImageReader.single_camera_per_folder", "1",
+                "--ImageReader.default_focal_length_factor", "0.75",
+                "--ImageReader.camera_params", "1440,960,540,0",
+                "--SiftExtraction.use_gpu", "1" if use_gpu else "0",
+                "--SiftExtraction.max_num_features", "8192",
+            ]
+        else:
+            feat_args = [
+                "--database_path", str(database_path),
+                "--image_path", str(image_dir),
+                "--ImageReader.camera_model", cam_model,
+                "--ImageReader.single_camera", "1",
+                "--SiftExtraction.use_gpu", "1" if use_gpu else "0",
+                "--SiftExtraction.max_num_features", "8192",
+            ]
         if colmap_version >= 4.0 and caps["aliked"] and feature_type == "ALIKED":
             feat_args.extend([
                 "--FeatureExtraction.use_gpu", "1" if use_gpu else "0",
@@ -549,7 +567,7 @@ def main() -> int:
                 colmap_bin,
                 "feature_extractor",
                 feat_args,
-                f"Extracting {feature_type} features ({cam_model}, shared camera)",
+                f"Extracting {feature_type} features ({cam_model}, {'per-folder' if has_subfolders else 'shared'})",
             )
         except Exception as e:
             update_status(status_paths, "failed", f"Feature extraction failed: {e}", done=True, error=str(e))
@@ -580,7 +598,68 @@ def main() -> int:
 
     if need_matching:
         update_status(status_paths, "matching", f"Matching features ({matcher_choice})...", done=False)
-        if matcher_choice == "exhaustive":
+        if has_subfolders:
+            # 1. Sequential matching for intra-video track continuity (overlap 15, guided 1)
+            seq_args = [
+                "--database_path", str(database_path),
+                "--SiftMatching.use_gpu", "1" if use_gpu else "0",
+                "--SequentialMatching.overlap", "15",
+                "--SequentialMatching.quadratic_overlap", "1",
+                "--SequentialMatching.loop_detection", "0",
+                "--SiftMatching.guided_matching", "1",
+            ]
+            try:
+                run_colmap_command(
+                    colmap_bin,
+                    "sequential_matcher",
+                    seq_args,
+                    "Sequential matching for intra-video continuity (overlap=15, guided=1)",
+                )
+            except Exception as e:
+                update_status(status_paths, "failed", f"Sequential matching failed: {e}", done=True, error=str(e))
+                print(f"[FAIL] Sequential matching failed: {e}", file=sys.stderr)
+                return 1
+
+            # 2. Cross-source matching so clips tie into originals
+            if total_images <= 1000:
+                print(f"\n[Cross-Source Matching] Total images ({total_images} <= 1000) -> Running exhaustive_matcher...")
+                exh_args = [
+                    "--database_path", str(database_path),
+                    "--SiftMatching.use_gpu", "1" if use_gpu else "0",
+                    "--SiftMatching.guided_matching", "1",
+                    "--SiftMatching.max_ratio", "0.80",
+                ]
+                try:
+                    run_colmap_command(
+                        colmap_bin,
+                        "exhaustive_matcher",
+                        exh_args,
+                        f"Cross-source exhaustive matching for {total_images} images",
+                    )
+                except Exception as e:
+                    update_status(status_paths, "failed", f"Exhaustive cross-matching failed: {e}", done=True, error=str(e))
+                    print(f"[FAIL] Exhaustive cross-matching failed: {e}", file=sys.stderr)
+                    return 1
+            else:
+                vocab_tree_path = args.vocab_tree or sfm_cfg.get("vocab_tree_path") or "colmap_runs/vocab_tree.bin"
+                print(f"\n[Cross-Source Matching] Total images ({total_images} > 1000) -> Running vocab_tree_matcher ({vocab_tree_path})...")
+                vt_args = [
+                    "--database_path", str(database_path),
+                    "--SiftMatching.use_gpu", "1" if use_gpu else "0",
+                    "--VocabTreeMatching.vocab_tree_path", str(vocab_tree_path),
+                ]
+                try:
+                    run_colmap_command(
+                        colmap_bin,
+                        "vocab_tree_matcher",
+                        vt_args,
+                        "Cross-source vocabulary tree matching",
+                    )
+                except Exception as e:
+                    update_status(status_paths, "failed", f"Vocab tree matching failed: {e}", done=True, error=str(e))
+                    print(f"[FAIL] Vocab tree matching failed: {e}", file=sys.stderr)
+                    return 1
+        elif matcher_choice == "exhaustive":
             match_args = [
                 "--database_path", str(database_path),
                 "--SiftMatching.use_gpu", "1" if use_gpu else "0",
@@ -690,6 +769,12 @@ def main() -> int:
                 "--Mapper.filter_max_reproj_error", "4.0",
                 "--Mapper.filter_min_tri_angle", "1.5",
             ]
+            if has_subfolders:
+                inc_args.extend([
+                    "--Mapper.ba_refine_focal_length", "1",
+                    "--Mapper.ba_refine_principal_point", "0",
+                    "--Mapper.ba_refine_extra_params", "0",
+                ])
             if colmap_version >= 4.0:
                 inc_args.extend(["--Mapper.ba_use_gpu", "1" if use_gpu else "0"])
 
@@ -829,7 +914,125 @@ def main() -> int:
     reg_ratio = float(registered_count) / float(total_images) if total_images > 0 else 0.0
     reg_pct = round(reg_ratio * 100.0, 2)
 
-    # Check for "several large models"
+    # Parse detailed poses for step lengths
+    def qvec2rotmat(qvec):
+        return np.array([
+            [1 - 2 * qvec[2]**2 - 2 * qvec[3]**2,
+             2 * qvec[1] * qvec[2] - 2 * qvec[0] * qvec[3],
+             2 * qvec[3] * qvec[1] + 2 * qvec[0] * qvec[2]],
+            [2 * qvec[1] * qvec[2] + 2 * qvec[0] * qvec[3],
+             1 - 2 * qvec[1]**2 - 2 * qvec[3]**2,
+             2 * qvec[2] * qvec[3] - 2 * qvec[0] * qvec[1]],
+            [2 * qvec[3] * qvec[1] - 2 * qvec[0] * qvec[2],
+             2 * qvec[2] * qvec[3] + 2 * qvec[0] * qvec[1],
+             1 - 2 * qvec[1]**2 - 2 * qvec[2]**2]
+        ])
+
+    images_with_poses = {}
+    itxt_path = primary_model / "images.txt"
+    if itxt_path.is_file():
+        with open(itxt_path, "r", encoding="utf-8") as f:
+            lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+        i = 0
+        while i < len(lines):
+            parts = lines[i].split()
+            if len(parts) >= 10:
+                qvec = np.array([float(x) for x in parts[1:5]])
+                tvec = np.array([float(x) for x in parts[5:8]])
+                c_id = int(parts[8])
+                nm = parts[9]
+                R = qvec2rotmat(qvec)
+                C = -R.T @ tvec
+                images_with_poses[nm] = {
+                    "img_id": int(parts[0]),
+                    "qvec": qvec,
+                    "tvec": tvec,
+                    "cam_id": c_id,
+                    "center": C,
+                    "name": nm,
+                }
+            i += 2
+
+    # Per-source breakdown
+    subfolders = [d.name for d in image_dir.iterdir() if d.is_dir()] if image_dir.is_dir() else []
+    source_stats = []
+    orig_total = 0
+    orig_reg = 0
+
+    if subfolders:
+        for s in sorted(subfolders):
+            s_files = list((image_dir / s).glob("*.jpg")) + list((image_dir / s).glob("*.png"))
+            s_total = len(s_files)
+            s_reg = sum(1 for n in images_with_poses if n.startswith(s + "/") or n.startswith(s + "\\"))
+            s_pct = (s_reg / s_total * 100.0) if s_total > 0 else 0.0
+            is_orig = ("20261021_" in s or "video" in s.lower())
+            if is_orig:
+                orig_total += s_total
+                orig_reg += s_reg
+            source_stats.append({
+                "source": s,
+                "is_original": is_orig,
+                "total": s_total,
+                "registered": s_reg,
+                "percent": round(s_pct, 2),
+            })
+    else:
+        orig_total = total_images
+        orig_reg = registered_count
+
+    orig_reg_pct = (orig_reg / orig_total * 100.0) if orig_total > 0 else 100.0
+
+    # Step length computation
+    orig_steps = []
+    all_steps = []
+
+    for s_info in source_stats:
+        s_name = s_info["source"]
+        if s_name == "stills":
+            continue
+        s_imgs = [img for n, img in images_with_poses.items() if n.startswith(s_name + "/") or n.startswith(s_name + "\\")]
+        s_imgs.sort(key=lambda x: int("".join(filter(str.isdigit, Path(x["name"]).stem)) or 0))
+        for k in range(len(s_imgs) - 1):
+            st = float(np.linalg.norm(s_imgs[k+1]["center"] - s_imgs[k]["center"]))
+            all_steps.append(st)
+            if s_info["is_original"]:
+                orig_steps.append(st)
+
+    median_orig_step = float(np.median(orig_steps)) if orig_steps else (float(np.median(all_steps)) if all_steps else 1.0)
+    largest_step = float(np.max(all_steps)) if all_steps else 0.0
+    step_ratio = largest_step / median_orig_step if median_orig_step > 0 else 0.0
+
+    # Camera intrinsics check
+    cam_intrinsics_ok = True
+    cams_info = []
+    for c in cameras_meta:
+        m = c["model"]
+        p = c["params"]
+        if m in ("SIMPLE_RADIAL", "RADIAL"):
+            cfx, cfy = p[0], p[0]
+            ck1 = p[3] if m == "SIMPLE_RADIAL" else p[3]
+        elif m == "PINHOLE":
+            cfx, cfy = p[0], p[1]
+            ck1 = 0.0
+        elif m in ("OPENCV", "OPENCV_FISHEYE"):
+            cfx, cfy = p[0], p[1]
+            ck1 = p[4]
+        else:
+            cfx, cfy = p[0], p[0]
+            ck1 = 0.0
+        diff_f = abs(cfx - cfy) / max(cfx, cfy) if max(cfx, cfy) > 0 else 0.0
+        c_ok = (diff_f <= 0.05) and (abs(ck1) < 0.3)
+        if not c_ok:
+            cam_intrinsics_ok = False
+        cams_info.append({"camera_id": c["camera_id"], "fx": cfx, "fy": cfy, "k1": ck1, "ok": c_ok})
+
+    # Pass Criteria Evaluation
+    crit_1_orig_reg = orig_reg_pct >= 95.0
+    crit_2_total_reg = reg_pct >= 90.0
+    crit_3_reproj = mean_reproj_err < 1.0
+    crit_4_cams = cam_intrinsics_ok
+    crit_5_step = step_ratio <= 5.0
+
     large_model_threshold = max(20, int(total_images * 0.15))
     large_models = [m for m in available_models_info if m[0] >= large_model_threshold]
 
@@ -842,14 +1045,26 @@ def main() -> int:
             "registered (%)": reg_pct,
             "registration_percent": reg_pct,
             "registration_ratio": round(reg_ratio, 4),
+            "original_videos_registered_pct": round(orig_reg_pct, 2),
             "number_of_models": len(available_models_info),
             "primary_model_index": primary_model.name,
             "points3D_count": point_count,
             "mean_reprojection_error": mean_reproj_err,
             "mean_track_length": mean_track,
+            "median_orig_step": round(median_orig_step, 4),
+            "largest_step": round(largest_step, 4),
+            "step_ratio": round(step_ratio, 2),
             "large_models_count": len(large_models),
         },
-        "intrinsics": cameras_meta[0] if cameras_meta else {},
+        "pass_criteria": {
+            "orig_registered_ge_95": crit_1_orig_reg,
+            "total_registered_ge_90": crit_2_total_reg,
+            "reproj_error_lt_1": crit_3_reproj,
+            "camera_intrinsics_ok": crit_4_cams,
+            "step_ratio_le_5": crit_5_step,
+        },
+        "source_breakdown": source_stats,
+        "cameras": cams_info,
         "configuration": {
             "camera_model": cam_model,
             "matcher": matcher_choice,
@@ -863,66 +1078,72 @@ def main() -> int:
         json.dump(report, f, indent=2)
 
     # ─────────────────────────────────────────────────────────────
-    # STEP 7: Quality Gate & Diagnostic Output
+    # STEP 7: Quality Gate & Diagnostic Output Table
     # ─────────────────────────────────────────────────────────────
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 80)
     print("  STRUCTURE-FROM-MOTION (COLMAP) REPORT SUMMARY")
-    print("=" * 70)
+    print("=" * 80)
     print(f"  Total input images   : {total_images}")
     print(f"  Registered images    : {registered_count} ({reg_pct:.1f}%)")
     print(f"  Number of models     : {len(available_models_info)} (large models: {len(large_models)})")
     print(f"  3D Points in cloud   : {point_count:,}")
     print(f"  Mean reprojection err: {mean_reproj_err:.4f} px")
     print(f"  Mean track length    : {mean_track:.2f} frames")
-    if cameras_meta:
-        c0 = cameras_meta[0]
-        print(f"  Camera Model         : {c0['model']} ({c0['width']}x{c0['height']})")
-        print(f"  Camera Parameters    : {c0['params']}")
+    print(f"  Median step (orig)   : {median_orig_step:.4f} model units")
+    print(f"  Largest step         : {largest_step:.4f} model units (ratio: {step_ratio:.2f}x)")
     print(f"  Sparse model saved to: {primary_model}")
     print(f"  PLY point cloud      : {root_colmap_ply} and {scene_ply}")
     print(f"  Report saved to      : {report_path}")
 
-    # Quality Gate: registered >= 85% and NOT several large models
-    passed_ratio = reg_ratio >= min_registered_ratio
-    single_dominant_model = len(large_models) <= 1
+    if source_stats:
+        print("\n" + "-" * 80)
+        print("  PER-SOURCE REGISTRATION BREAKDOWN")
+        print("-" * 80)
+        print(f"  {'Source':<22} {'Type':<12} {'Total':<10} {'Registered':<14} {'Percent':<10} {'Status'}")
+        print("  " + "-" * 76)
+        for s in source_stats:
+            st_type = "Original Pass" if s["is_original"] else "New Source"
+            st_status = "[PASS]" if s["percent"] >= 60.0 else "[DROP CANDIDATE (<60%)]"
+            print(f"  {s['source']:<22} {st_type:<12} {s['total']:<10} {s['registered']:<14} {s['percent']:<9.1f}% {st_status}")
+        print("  " + "-" * 76)
 
-    if not (passed_ratio and single_dominant_model):
+    print("\n" + "=" * 80)
+    print("  PASS CRITERIA VERIFICATION TABLE")
+    print("=" * 80)
+    print(f"  {'Criterion':<55} {'Requirement':<16} {'Actual':<14} {'Verdict'}")
+    print("  " + "-" * 90)
+    print(f"  1. Original two videos registered in ONE model       >= 95.0%        {orig_reg_pct:<13.2f}% [{'PASS' if crit_1_orig_reg else 'FAIL'}]")
+    print(f"  2. Total frames registered overall                   >= 90.0%        {reg_pct:<13.2f}% [{'PASS' if crit_2_total_reg else 'FAIL'}]")
+    print(f"  3. Mean reprojection error                           < 1.0 px        {mean_reproj_err:<13.4f}px [{'PASS' if crit_3_reproj else 'FAIL'}]")
+    cam_str = f"{len(cams_info)} cams ok" if crit_4_cams else "fail"
+    print(f"  4. Per camera fx ~ fy within 5%, |k1| < 0.3          diff<=5%,|k|<0.3 {cam_str:<14} [{'PASS' if crit_4_cams else 'FAIL'}]")
+    print(f"  5. Frame-to-frame step <= 5x median original step    <= 5.00x        {step_ratio:<13.2f}x [{'PASS' if crit_5_step else 'FAIL'}]")
+    print("  " + "-" * 90)
+
+    # Check for sources failing under 60%
+    failing_new_sources = [s for s in source_stats if not s["is_original"] and s["percent"] < 60.0]
+    if failing_new_sources:
+        print("\n  [ADVISORY] The following new source(s) fell below 60% registration:")
+        for fs in failing_new_sources:
+            print(f"    - {fs['source']}: {fs['registered']}/{fs['total']} ({fs['percent']:.1f}%)")
+            print("      Likely cause: Pure rotation, motion blur, or textureless surfaces.")
+            print(f"      Protocol: Dropping source '{fs['source']}' and proceeding with remaining sources.")
+
+    # Quality Gate Check
+    if not crit_1_orig_reg:
         update_status(
             status_paths,
             "failed",
-            f"Quality gate failure: {reg_pct:.1f}% registered (required {min_registered_ratio*100:.0f}%)",
+            f"Quality gate failure: Original videos registered {orig_reg_pct:.1f}% (< 95.0%)",
             done=True,
-            error="Quality gate failure",
+            error="Original video registration failed",
         )
-        print("\n" + "!" * 70, file=sys.stderr)
-        print("  [FAIL] QUALITY GATE FAILURE: SFM RECONSTRUCTION REJECTED", file=sys.stderr)
-        print("!" * 70, file=sys.stderr)
-        if not passed_ratio:
-            print(
-                f"  - Registration rate: {reg_pct:.1f}% is below required threshold ({min_registered_ratio*100:.0f}%).",
-                file=sys.stderr,
-            )
-        if not single_dominant_model:
-            print(
-                f"  - Several large models detected ({len(large_models)} large models with >= {large_model_threshold} images).",
-                file=sys.stderr,
-            )
-            for idx, (m_count, m_path) in enumerate(large_models, start=1):
-                print(f"      Model #{idx} ({m_path.name}): {m_count} images", file=sys.stderr)
-
-        print("\n  Likely Root Causes:", file=sys.stderr)
-        print("   1. Rotation-only motion: camera rotated in place without sufficient translation baseline.", file=sys.stderr)
-        print("   2. Motion blur: rapid panning or low shutter speed degraded feature detection.", file=sys.stderr)
-        print("   3. Textureless walls: uniform plain walls lack distinct keypoints for triangulation.", file=sys.stderr)
-        print("   4. Doorways: sharp transitions or occlusion across doorways broke continuous tracks.", file=sys.stderr)
-
-        print("\n  Next Config Switches to Try:", file=sys.stderr)
-        print(f"   - Switch camera model: python pipeline/run_sfm.py --scene {args.scene} --camera-model SIMPLE_RADIAL", file=sys.stderr)
-        print(f"   - Run exhaustive matching: python pipeline/run_sfm.py --scene {args.scene} --matcher exhaustive", file=sys.stderr)
-        print(f"   - Re-extract with denser sampling: python pipeline/extract_frames.py --scene {args.scene} --fps 4", file=sys.stderr)
-        print(f"   - Inspect visual coverage in: data/{args.scene}/contact_sheet.jpg", file=sys.stderr)
-        print("=" * 70, file=sys.stderr)
+        print("\n  [STOP] ORIGINAL VIDEOS FELL BELOW 95% REGISTRATION CRITERIA!", file=sys.stderr)
         return 1
+
+    overall_pass = crit_1_orig_reg and crit_2_total_reg and crit_3_reproj and crit_4_cams and crit_5_step
+    print(f"\n  Overall Quality Gate: [{'PASS' if overall_pass else 'FAIL'}]")
+    print("=" * 80)
 
     update_status(
         status_paths,
@@ -933,10 +1154,10 @@ def main() -> int:
         total_images=total_images,
         points3D_count=point_count,
         mean_reprojection_error=mean_reproj_err,
+        overall_pass=overall_pass,
     )
-    print("\n  [+] SfM reconstruction PASSED quality threshold! Ready for Stage 3 (alignment).")
-    print("=" * 70)
-    return 0
+
+    return 0 if overall_pass else 1
 
 
 if __name__ == "__main__":

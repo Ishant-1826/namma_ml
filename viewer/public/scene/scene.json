@@ -1,34 +1,39 @@
 {
   "scene": "home",
   "units": "metres",
-  "splat_count": 439824,
-  "floor_y": 0.0,
-  "ceiling_y": 4.1,
+  "coordinate_convention": "Right-handed, Y-up, metric (floor at y = 0.0)",
   "bounds": {
     "min": [
-      -5.825,
-      -0.299,
-      -4.415
+      -5.825468063354492,
+      -0.29972001910209656,
+      -4.647172927856445
     ],
     "max": [
-      3.957,
-      2.987,
-      7.074
+      4.018671035766602,
+      3.0131211280822754,
+      7.446920394897461
     ]
   },
+  "floor_y": 0.0,
+  "ceiling_y": 4.1,
   "spawn_position": [
-    1.771,
+    1.77131696194836,
     1.45,
-    3.523
+    3.523052738060902
   ],
   "spawn_yaw": -0.0426,
+  "spawn_yaw_deg": -2.44,
+  "spawn_yaw_convention": "Rotation about +Y in radians, counter-clockwise seen from above; yaw 0 looks along -Z (Three.js convention)",
+  "splat_count": 700000,
+  "splat_file": "scene.splat",
+  "splat_files": {
+    "splat": "scene.splat",
+    "spz": "scene.spz"
+  },
   "splat_rotation_euler": [
     0.0,
     0.0,
     0.0
   ],
-  "splat_files": {
-    "spz": "scene.spz",
-    "splat": "scene.splat"
-  }
+  "splat_rotation_note": "The data is already Y-up and metric, so start with [0, 0, 0]; viewer must verify it."
 }

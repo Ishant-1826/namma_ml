@@ -200,7 +200,9 @@ export class FirstPersonControls {
 
   public limitToWalkable: boolean;
   public headBobEnabled = false;
-  public exploreUnknown = false;
+  public exploreUnknown = true; // default: explore mode (unknown cells state 0 passable)
+  public lastBlockingCell: { col: number; row: number } | null = null;
+  public collisionOverlayVisible = false;
 
   private _fixedEyeHeight = EYE_HEIGHT_M;
   private _spawnPosition = new THREE.Vector3(0, EYE_HEIGHT_M, 0);
@@ -228,7 +230,7 @@ export class FirstPersonControls {
   private readonly _euler = new THREE.Euler(0, 0, 0, "YXZ");
   private readonly _velocity = new THREE.Vector3(0, 0, 0);
   private readonly _wishDir = new THREE.Vector3(0, 0, 0);
-  private readonly _moveResult: MoveResult = { x: 0, z: 0, hitX: false, hitZ: false };
+  private readonly _moveResult: MoveResult = { x: 0, z: 0, hitX: false, hitZ: false, lastBlockingCell: null };
 
   // Input states
   private _keys = {
@@ -244,6 +246,7 @@ export class FirstPersonControls {
   public onHeadBobChange?: (enabled: boolean) => void;
   public onWalkableLimitChange?: (enabled: boolean) => void;
   public onExploreUnknownChange?: (enabled: boolean) => void;
+  public onCollisionOverlayChange?: (visible: boolean) => void;
 
   // Bound event handlers for clean teardown
   private readonly _onMouseMove: (e: MouseEvent) => void;
@@ -337,6 +340,9 @@ export class FirstPersonControls {
           break;
         case "KeyU":
           this.toggleExploreUnknown();
+          break;
+        case "KeyG":
+          this.toggleCollisionOverlay();
           break;
       }
     };
@@ -549,6 +555,12 @@ export class FirstPersonControls {
     return this.exploreUnknown;
   }
 
+  toggleCollisionOverlay(): boolean {
+    this.collisionOverlayVisible = !this.collisionOverlayVisible;
+    this.onCollisionOverlayChange?.(this.collisionOverlayVisible);
+    return this.collisionOverlayVisible;
+  }
+
   startTouchSession(): void {
     this._isLocked = true;
     this.onLockChange?.(true);
@@ -663,6 +675,10 @@ export class FirstPersonControls {
 
       let newX = this._moveResult.x;
       let newZ = this._moveResult.z;
+
+      if (this._moveResult.lastBlockingCell) {
+        this.lastBlockingCell = this._moveResult.lastBlockingCell;
+      }
 
       if (this._sceneBounds) {
         const clamped = clampToBounds(newX, newZ, this._sceneBounds);

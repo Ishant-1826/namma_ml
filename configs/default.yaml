@@ -75,8 +75,9 @@ occupancy:
   free_sfm_subsample: 1
   collapse_free_slab_ratio: 0.60
   remove_isolated_occupied: true
-  inflation_m: 0.12
+  inflation_m: 0.07
   player_radius_m: 0.08
+  total_body_radius_m: 0.15
   unknown_ok_radius_m: 0.30
 convention:
   up: Y

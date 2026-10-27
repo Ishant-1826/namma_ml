@@ -63,6 +63,22 @@
         <span class="stats-value" id="stats-pos">—</span>
       </div>
       <div class="stats-item">
+        <span class="stats-label">Grid Cell:</span>
+        <span class="stats-value" id="stats-cell">—</span>
+      </div>
+      <div class="stats-item">
+        <span class="stats-label">Cell State:</span>
+        <span class="stats-value" id="stats-state">—</span>
+      </div>
+      <div class="stats-item">
+        <span class="stats-label">Clearance:</span>
+        <span class="stats-value" id="stats-clearance">—</span>
+      </div>
+      <div class="stats-item">
+        <span class="stats-label">Last Blocker:</span>
+        <span class="stats-value" id="stats-blocker">—</span>
+      </div>
+      <div class="stats-item">
         <span class="stats-label">Yaw:</span>
         <span class="stats-value" id="stats-yaw">—</span>
       </div>
@@ -79,6 +95,10 @@
         <span class="stats-value" id="stats-collision">ON (r=0.08m)</span>
       </div>
       <div class="stats-item">
+        <span class="stats-label">Collision Mesh:</span>
+        <span class="stats-value" id="stats-overlay">OFF (Key G)</span>
+      </div>
+      <div class="stats-item">
         <span class="stats-label">Head-Bob:</span>
         <span class="stats-value" id="stats-headbob">OFF (Key H)</span>
       </div>
@@ -88,7 +108,7 @@
       </div>
       <div class="stats-item">
         <span class="stats-label">Explore Unknown:</span>
-        <span class="stats-value" id="stats-explore">OFF (Key U)</span>
+        <span class="stats-value" id="stats-explore">ON (Key U)</span>
       </div>
     </div>
   </div>
@@ -121,7 +141,11 @@
           </div>
           <div class="control-row">
             <span class="key-badge">U</span>
-            <span class="control-desc">Explore unreconstructed areas (Toggle)</span>
+            <span class="control-desc">Strict mode toggle (Default: Explore Mode)</span>
+          </div>
+          <div class="control-row">
+            <span class="key-badge">G</span>
+            <span class="control-desc">Toggle collision mesh overlay (Translucent Red)</span>
           </div>
           <div class="control-row">
             <span class="key-badge">B</span>

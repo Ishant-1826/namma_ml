@@ -463,9 +463,14 @@ def build_occupancy_grid(
     unknown_cell = (~occ_cell) & (~known_free_cell)
 
     # Inflation & Blocked data
-    dist_from_occ = scipy.ndimage.distance_transform_edt(~occ_cell) * cell_size
-    inflated_cells = (dist_from_occ <= inflation_m) & (~occ_cell)
-    is_blocked_occ_infl = (dist_from_occ <= inflation_m)
+    if 0 < inflation_m < cell_size:
+        struct_infl = scipy.ndimage.generate_binary_structure(2, 1)
+        inflated_cells = scipy.ndimage.binary_dilation(occ_cell, structure=struct_infl, iterations=1) & (~occ_cell)
+        is_blocked_occ_infl = occ_cell | inflated_cells
+    else:
+        dist_from_occ = scipy.ndimage.distance_transform_edt(~occ_cell) * cell_size
+        inflated_cells = (dist_from_occ <= inflation_m) & (~occ_cell)
+        is_blocked_occ_infl = (dist_from_occ <= inflation_m)
 
     dist_from_known_free = scipy.ndimage.distance_transform_edt(~known_free_cell) * cell_size
     unknown_blocked = unknown_cell & (dist_from_known_free > unknown_ok_radius_m)

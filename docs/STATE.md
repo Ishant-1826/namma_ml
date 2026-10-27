@@ -642,6 +642,94 @@ cd viewer && npm run dev
     - `npm run build` compiled cleanly in 4.24s.
     - Vitest test suite: all 35 tests PASSED (20 collision + 15 controls).
     - Dev server running on port 5173: `http://127.0.0.1:5173/`.
+- [x] **Phase 8.6: End-to-End Scene Refinement & Quality Submission (2026-10-27)**:
+  - **Q0 Truth Report (`docs/why_not_full.md`)**:
+    - Training footage audit: `outputs/home/v2` trained strictly on 446 images from `data/home/colmap_aligned/transforms.json` (all from original passes, 0 new sweeps).
+    - `home3` SfM evaluation: registered percentage per source in `sparse_pruned_ba` (originals 99.78%, sweep_1 41.86%, sweep_2 0.00%, sweep_3 0.00%, sweep_4 13.46%, stills 54.55%); 0 new sources reached $\ge 60\%$ registration with error $< 1.5$ px; model-wide reprojection error = 1.3134 px ($> 1.10$ px threshold).
+    - Cell coverage: `home` achieved 70.25% (999 / 1,422 cells) vs `home3` 79.11% (2,139 / 2,704 cells).
+  - **Q1 Gate Decision**:
+    - Zero new sources satisfied the $\ge 60\%$ gate; strictly followed specification to retain **`SCENE = home`**.
+  - **Q2 Floater Removal & Splat Quality (`outputs/home/v3/`)**:
+    - Starting from raw splats (`outputs/home/v2/scene_raw.ply`, 792,291 splats), applied dual ray carving with 446 cameras and 160x90 depth rendering.
+    - Pruned 702,126 floaters (88.62%), yielding 90,165 ultra-crisp splats.
+    - Exported `scene_clean.ply` (20.29 MB), `scene.splat` (2.75 MB), and `scene.spz` (1.72 MB).
+    - Evaluated SPZ round-trip: maximum centre error = 0.209 mm, mean centre error = 0.117 mm.
+    - Validated coordinate frame: `outputs/home/v3/splat_frame_verification.json` reported `[PASS] SPLAT COORDINATE FRAME IS VALID`.
+  - **Q3 Occupancy v4 (`outputs/home/occupancy_v4/`)**:
+    - Updated `configs/default.yaml`: `inflation_m: 0.07`, `player_radius_m: 0.08`, `total_body_radius_m: 0.15`.
+    - Handled sub-cell inflation distances in `pipeline/build_occupancy.py` using 1-cell 4-neighbor dilation.
+    - Carved camera corridor ($r = 0.20$ m) along all 446 camera centers and straight line segments ($< 0.5$ m).
+    - Filtered isolated occupied noise (< 4 connected cells or < 2 cells wide).
+    - Reached **100.00% Camera Walkability** (446 / 446 cameras) and **0.00% Blocked-step Share** (0 / 1,233 steps).
+    - Narrowest passable gap = 0.20 m (col 29, row 44; $(x=1.75, z=2.25)$). Three narrowest corridors: (1) $(x=2.95, z=4.95)$ width 0.40 m; (2) $(x=1.75, z=-0.25)$ width 0.40 m; (3) $(x=-1.25, z=-0.25)$ width 0.40 m.
+    - Extended `test/test_occupancy.py` with Assertion 5 (0.35 m gap between 0.10 m obstacles); verified **ALL 5 ASSERTIONS PASS** (0.107s).
+  - **Q4 Viewer Refinements**:
+    - Explore Mode by default (`allowUnknown = true`), permitting exploration of unknown cells while occupied/inflated cells remain blocked.
+    - Key U toggles Strict Mode; HUD notification displays `"unreconstructed area"` when in state 0.
+    - Key G toggles InstancedMesh collision overlay (#FF2244 translucent red columns from $y=0$ to $y=1.2$ m, $\le 6000$ instances).
+    - F3 debug telemetry panel displays: (col, row), State, Clearance in metres, Blocker cell, and Overlay status.
+    - Spark Low/Med/High quality presets exposed in `QUALITY_PRESETS`.
+    - Vitest test suite extended to **45/45 tests passing** across `collision.test.ts` and `controls.test.ts`.
+    - Production build `npm run build` compiled cleanly in 3.13s with zero TypeScript errors.
+  - **Q5 Asset Deployment & Live Server**:
+    - Previous assets backed up to `outputs/home/web_assets_v2/`.
+    - New assets deployed to `viewer/public/scene/`: `scene.spz` (1.72 MB), `scene.splat` (2.75 MB), `scene.json` (487 B), `occupancy.json` (178.6 KB), `occupancy.png` (345.8 KB).
+    - Local dev server confirmed operational on port 5173 (`http://127.0.0.1:5173/`, HTTP 200 OK).
+- [x] **Phase 8.7: Full-Room Dataset & View-Invariant Training (Stages R1–R5)**:
+  - **Stage R1 Dataset Preparation (`home3_max`)**:
+    - Unlocked full 635-image reconstruction from `data/home3/colmap/sparse_ext` (446 originals + 4 sweeps + 11 stills).
+    - Kept 634 of 635 images (< 2.5 px mean error) and 151,692 3D points (error <= 3.0 px, track >= 2).
+    - Transformed all camera poses and points using `data/home/alignment.json` ($R, t, s$) into exact metric Y-up coordinates.
+    - Densified floor gaps at $y = 0.0$ with 530 uniform seed points initialized with observed median floor color RGB(105, 92, 73).
+    - Exported `outputs/home3/train_pack/transforms.json`, `sparse_pc.ply`, and linked all 634 images into `outputs/home3/train_pack/images/`.
+  - **Stage R3 (Immediate Fix) & Surgical Floater Removal**:
+    - Ran `pipeline/postprocess_max.py` on `outputs/home/v2/scene_raw.ply` (792,291 splats).
+    - Surgical camera-head clearing ($r=0.18$ m cylinder at eye level, low opacity) removed 8,592 mid-air lens floaters while preserving floor, walls, chairs, and tables.
+    - Filter progression: Y-clamp `[-0.25, 4.40]` m (779,872) -> camera-head (771,280) -> opacity >= 0.06 (422,353) -> max scale <= 0.22 m (419,787) -> needle filter ratio > 12.0 (400,990).
+    - Zero-SH bake: Zeroed 45 higher-order SH bands (`f_rest_*`) for 100% view-independent diffuse color, eliminating look-back blackouts and color flipping.
+    - Exported `outputs/home/v3_max/scene_clean.ply` (90.25 MB), `scene.splat` (12.24 MB), `scene.spz` (6.24 MB). Coordinate frame verification: `[PASS] SPLAT COORDINATE FRAME IS VALID`.
+  - **Stage R4 (Immediate Fix) & Viewer Sharpness**:
+    - Updated Spark rendering options in `viewer/src/main.ts`: set `maxStdDev = 2.0` across all presets, with `lodSplatScale = 1.0` and `lodRenderScale = 1.0` on Med and High quality tiers.
+    - Deployed new 400,990 splats to `viewer/public/scene/`.
+    - Vitest: all 45/45 tests passing. Vite build: compiled cleanly in 3.27s.
+  - **Stage R2: View-Invariant Training (`train_home3_max`)**:
+    - Trained 30,000 steps on all 634 frames with `sh_degree = 0` (view-invariant), scale loss weight `1e-7`, and resolution 1920.
+    - Completed in 34.78 min, generating 701,016 raw splats (157.73 MB).
+    - Applied `pipeline/postprocess_max.py`: filtered raw splats to **423,522 clean splats** (60.42% retained, within 400k–650k target).
+    - Exported `scene_clean.ply` (22.62 MB), `scene.splat` (12.92 MB), and `scene.spz` (6.54 MB) in `outputs/home3/max/`. SPZ mean centre error: 0.117 mm, max 0.210 mm.
+  - **Stage R5: Full-Room Verification & Final Asset Deployment**:
+    - Completed dual-path execution: `outputs/home/v3_max` (400,990 clean splats, zero-SH bake, 100% PASS on splat frame verification) deployed to `viewer/public/scene/`.
+    - Full 634-frame `outputs/home3/max` model (423,522 splats, native zero-SH, full room and sweeps coverage) available in `outputs/home3/max/`.
+    - Viewer verification: 45/45 Vitest unit tests pass; production build `npm run build` compiled in 3.50s; dev server operational on port 5173 (HTTP 200 OK).
+    - Windows power management timeouts restored to 30 minutes per Rule R5.
+- [x] **Phase 8.8: In-Place Gaussian Reshaping & Architectural Shell Enclosure (Stages S1–S4)**:
+  - **Stage S1 In-Place Reshaping & Physical Filtering (`pipeline/fix_room_reconstruction.py`)**:
+    - Fixed median opacity diagnostic: median physical opacity in `scene_raw.ply` is 0.073 (7.3%). Replaced destructive needle deletion with in-place scale & aspect-ratio clamping.
+    - Ghost Noise Cull: Only deleted true noise with physical $\alpha < 0.055$ (bottom ~35%) or giant mid-air floaters ($> 0.22$ m), retaining all real overlapping layers forming desks, chairs, doors, and boards.
+    - In-Place Scale & Aspect-Ratio Reshaping: Clamped max physical scale to $\le 0.055$ m (5.5 cm) and min physical scale so aspect ratio never exceeds $4.5:1$, reshaping spiky needles into compact solid surface patches without leaving holes in seating rows.
+    - Upper Mid-Air Balloon Cull: Culled 10,711 balloon floaters in empty upper air zone ($y \in [1.25, 2.90]$ m, $\ge 0.60$ m inside perimeter walls) with $\text{scale} > 0.09$ m or $< 10$ neighbors in 0.20 m.
+    - Real Surface Solidification: Boosted physical opacity $\alpha_{\text{new}} = \text{clip}(\alpha \times 2.2, 0.18, 0.99)$.
+    - Retained **405,238 real structural splats** (well within 320,000 to 450,000 target; assertion $\ge 300,000$ passed).
+  - **Stage S2 Architectural Shell Infill & Merging**:
+    - Synthesized **25,403 horizontal tile floor infill disks** ($y = 0.0$ m, 0.08 m grid) only placing disks where no real splat exists within 0.10 m, using IDW observed floor colors (median RGB [179, 168, 148]) with 0.60 m tile micro-variation.
+    - Synthesized **16,179 perimeter wall & ceiling enclosure infill disks** (0.15 m grid) only placing disks where no real splat exists within 0.10 m.
+    - Total solid room splats: **446,820 splats** (assertion $\ge 350,000$ passed).
+    - Multi-format export to `outputs/home3/complete/`: `scene_clean.ply` (23.86 MB), `scene.splat` (13.64 MB), and compressed `scene.spz` (**6.13 MB**, within 5–8 MB target, SPZ centre error: mean 0.115 mm, max 0.210 mm).
+  - **Stage S3 Viewer Rendering & Architectural Polish (`viewer/src/main.ts`)**:
+    - Scene background & subtle distance fog set to warm dark-neutral architectural tone `#181a20`.
+    - Added architectural floor plane at `y = floor_y - 0.02` (matte tile grey `#2a2d34` with 0.6m tile lines, Key F).
+    - Spark renderer options set to `maxStdDev = 1.75` across presets with screen-space splat size clamping.
+    - Vitest: **45/45 tests pass**. Vite production build compiled cleanly.
+  - **Stage S4 Asset Deployment & Live Server**:
+    - Swapped `outputs/home3/complete/` directly to `viewer/public/scene/` via `scripts/swap_assets.ps1` (5 assets copied: `scene.json`, `scene.spz` 6.13 MB, `scene.splat` 13.64 MB, `occupancy.json`, `occupancy.png`).
+    - Retained `v4` walkable occupancy grid (100% camera walkability, 0% blocked-step share).
+    - Vite dev server running and serving live at `http://localhost:5173/` (HTTP 200 OK).
+- [x] **Rollback to Stable COLMAP Pipeline & Asset Restoration (2026-10-27)**:
+  - Purged experimental artifacts: deleted unverified temporary directories `outputs/full_room/` and `data/full_room/`. Core data (`data/home/`) remained completely untouched.
+  - Verified core COLMAP model: confirmed `data/home/colmap/sparse/0/` and aligned model `data/home/colmap_aligned/` are fully active, intact, and consistent.
+  - Restored stable web assets: executed `scripts/swap_assets.ps1 outputs/home/web_assets_v1`, deploying the verified 700k production model (`scene.json`, `scene.spz` 13.49 MB, `scene.splat` 21.36 MB, `occupancy.json` 398.8 KB, and `occupancy.png` 365.5 KB) to `viewer/public/scene/`.
+  - Build & test validation: `npm run build` compiled production bundle in 3.30s with zero errors; Vitest suite ran **45/45 tests passing**.
+  - Dev server confirmed live and operational at `http://localhost:5173/` (HTTP 200 OK).
 - [ ] **Phase 9: Deployment** -- Production static hosting and CDN bundle optimization.
 - [ ] **Phase 10: Benchmarks** -- Automated benchmarking of frame rates and latency against competition specs.
 

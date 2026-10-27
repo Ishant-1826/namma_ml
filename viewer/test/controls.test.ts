@@ -1,4 +1,5 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
+import * as THREE from "three";
 import {
   clampPitch,
   computeWishDirection,
@@ -10,6 +11,7 @@ import {
   ACCELERATION,
   STOP_TIME_S,
   EYE_HEIGHT_M,
+  FirstPersonControls,
 } from "../src/controls";
 
 describe("First-Person Movement Maths", () => {
@@ -180,6 +182,83 @@ describe("First-Person Movement Maths", () => {
   describe("5. Eye Height Configuration", () => {
     it("confirms EYE_HEIGHT_M is 1.45 m matching captured video height", () => {
       expect(EYE_HEIGHT_M).toBe(1.45);
+    });
+  });
+
+  describe("6. FirstPersonControls Explore Mode & Collision Overlay", () => {
+    let controls: FirstPersonControls;
+    let camera: THREE.PerspectiveCamera;
+    let domElement: HTMLElement;
+
+    beforeEach(() => {
+      // Mock window and document if running in node environment
+      if (typeof (globalThis as any).window === "undefined") {
+        (globalThis as any).window = {
+          addEventListener: () => {},
+          removeEventListener: () => {},
+          matchMedia: () => ({ matches: false }),
+        };
+      }
+      if (typeof (globalThis as any).document === "undefined") {
+        (globalThis as any).document = {
+          addEventListener: () => {},
+          removeEventListener: () => {},
+          pointerLockElement: null,
+          exitPointerLock: () => {},
+        };
+      }
+
+      camera = new THREE.PerspectiveCamera();
+      domElement = {
+        style: {},
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        requestPointerLock: () => {},
+      } as unknown as HTMLElement;
+
+      controls = new FirstPersonControls(camera, domElement);
+    });
+
+    it("defaults exploreUnknown to true (Explore Mode is default)", () => {
+      expect(controls.exploreUnknown).toBe(true);
+    });
+
+    it("defaults collisionOverlayVisible to false", () => {
+      expect(controls.collisionOverlayVisible).toBe(false);
+    });
+
+    it("toggles exploreUnknown and notifies callback", () => {
+      let notifiedVal = false;
+      controls.onExploreUnknownChange = (val) => {
+        notifiedVal = val;
+      };
+
+      const newState = controls.toggleExploreUnknown();
+      expect(newState).toBe(false);
+      expect(controls.exploreUnknown).toBe(false);
+      expect(notifiedVal).toBe(false);
+
+      const secondState = controls.toggleExploreUnknown();
+      expect(secondState).toBe(true);
+      expect(controls.exploreUnknown).toBe(true);
+      expect(notifiedVal).toBe(true);
+    });
+
+    it("toggles collisionOverlayVisible and notifies callback", () => {
+      let notifiedVal = false;
+      controls.onCollisionOverlayChange = (val) => {
+        notifiedVal = val;
+      };
+
+      const newState = controls.toggleCollisionOverlay();
+      expect(newState).toBe(true);
+      expect(controls.collisionOverlayVisible).toBe(true);
+      expect(notifiedVal).toBe(true);
+
+      const secondState = controls.toggleCollisionOverlay();
+      expect(secondState).toBe(false);
+      expect(controls.collisionOverlayVisible).toBe(false);
+      expect(notifiedVal).toBe(false);
     });
   });
 });

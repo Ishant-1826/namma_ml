@@ -19,6 +19,7 @@ export interface MoveResult {
   z: number;
   hitX: boolean;
   hitZ: boolean;
+  lastBlockingCell?: { col: number; row: number } | null;
 }
 
 export interface SceneBounds {
@@ -55,7 +56,7 @@ export function isBlocked(
   col: number,
   row: number,
   limitToWalkable = false,
-  allowUnknown = false
+  allowUnknown = true
 ): boolean {
   if (col < 0 || col >= grid.width || row < 0 || row >= grid.height) {
     return true; // outside grid is always blocked
@@ -68,7 +69,7 @@ export function isBlocked(
     if (s === 2 || s === 3) {
       return true;
     }
-    // Unknown (state 0): blocked when allowUnknown is false (default), allowed when allowUnknown is true
+    // Unknown (state 0): blocked when allowUnknown is false (strict mode), allowed when allowUnknown is true (explore mode)
     if (s === 0) {
       return !allowUnknown;
     }
@@ -97,7 +98,7 @@ export function isPointBlocked(
   x: number,
   z: number,
   limitToWalkable = false,
-  allowUnknown = false
+  allowUnknown = true
 ): boolean {
   const col = Math.floor((x - grid.origin[0]) / grid.cell_size);
   const row = Math.floor((z - grid.origin[1]) / grid.cell_size);
@@ -125,6 +126,7 @@ export function isPointInUnknownCell(
  * Circle-vs-grid collision test.
  * The circle is blocked if any cell its bounding square overlaps that is blocked
  * lies within the radius of the circle centre (nearest-point-on-cell test).
+ * Records outBlockingCell { col, row } if provided and a collision occurs.
  */
 export function isCircleBlocked(
   grid: OccupancyGrid,
@@ -132,7 +134,8 @@ export function isCircleBlocked(
   cz: number,
   radius: number,
   limitToWalkable = false,
-  allowUnknown = false
+  allowUnknown = true,
+  outBlockingCell?: { col: number; row: number }
 ): boolean {
   const originX = grid.origin[0];
   const originZ = grid.origin[1];
@@ -160,6 +163,10 @@ export function isCircleBlocked(
         const dx = cx - nearestX;
         const dz = cz - nearestZ;
         if (dx * dx + dz * dz < rSq) {
+          if (outBlockingCell) {
+            outBlockingCell.col = col;
+            outBlockingCell.row = row;
+          }
           return true;
         }
       }
@@ -178,7 +185,7 @@ export function getDistanceToFree(
   x: number,
   z: number,
   limitToWalkable = false,
-  allowUnknown = false,
+  allowUnknown = true,
   maxSearchRings = 25
 ): number {
   if (!isPointBlocked(grid, x, z, limitToWalkable, allowUnknown)) {
@@ -249,9 +256,10 @@ export function isMoveAllowed(
   toZ: number,
   radius: number,
   limitToWalkable = false,
-  allowUnknown = false
+  allowUnknown = true,
+  outBlockingCell?: { col: number; row: number }
 ): boolean {
-  if (!isCircleBlocked(grid, toX, toZ, radius, limitToWalkable, allowUnknown)) {
+  if (!isCircleBlocked(grid, toX, toZ, radius, limitToWalkable, allowUnknown, outBlockingCell)) {
     return true;
   }
 
@@ -282,7 +290,7 @@ export function resolveMovement(
   allowUnknownOrOut?: boolean | MoveResult,
   maybeOutResult?: MoveResult
 ): MoveResult {
-  let allowUnknown = false;
+  let allowUnknown = true; // default Explore mode
   let outResult: MoveResult | undefined = maybeOutResult;
   if (typeof allowUnknownOrOut === "boolean") {
     allowUnknown = allowUnknownOrOut;
@@ -290,7 +298,7 @@ export function resolveMovement(
     outResult = allowUnknownOrOut;
   }
 
-  const result: MoveResult = outResult ?? { x: curX, z: curZ, hitX: false, hitZ: false };
+  const result: MoveResult = outResult ?? { x: curX, z: curZ, hitX: false, hitZ: false, lastBlockingCell: null };
   result.x = curX;
   result.z = curZ;
   result.hitX = false;
@@ -306,18 +314,23 @@ export function resolveMovement(
   const stepDx = dx / numSteps;
   const stepDz = dz / numSteps;
 
+  const scratchBlockingCell = { col: -1, row: -1 };
+
   for (let s = 0; s < numSteps; s++) {
     const targetX = result.x + stepDx;
     const targetZ = result.z + stepDz;
 
     // 1. Try full diagonal move
-    if (isMoveAllowed(grid, result.x, result.z, targetX, targetZ, radius, limitToWalkable, allowUnknown)) {
+    if (isMoveAllowed(grid, result.x, result.z, targetX, targetZ, radius, limitToWalkable, allowUnknown, scratchBlockingCell)) {
       result.x = targetX;
       result.z = targetZ;
     } else {
+      if (scratchBlockingCell.col >= 0) {
+        result.lastBlockingCell = { col: scratchBlockingCell.col, row: scratchBlockingCell.row };
+      }
       // 2. Full move blocked: Try sliding along X or Z
-      const canX = stepDx !== 0 && isMoveAllowed(grid, result.x, result.z, targetX, result.z, radius, limitToWalkable, allowUnknown);
-      const canZ = stepDz !== 0 && isMoveAllowed(grid, result.x, result.z, result.x, targetZ, radius, limitToWalkable, allowUnknown);
+      const canX = stepDx !== 0 && isMoveAllowed(grid, result.x, result.z, targetX, result.z, radius, limitToWalkable, allowUnknown, scratchBlockingCell);
+      const canZ = stepDz !== 0 && isMoveAllowed(grid, result.x, result.z, result.x, targetZ, radius, limitToWalkable, allowUnknown, scratchBlockingCell);
 
       if (canX && !canZ) {
         result.x = targetX;
@@ -344,6 +357,41 @@ export function resolveMovement(
   }
 
   return result;
+}
+
+/**
+ * Returns the state value (0 unknown, 1 free, 2 occupied, 3 inflated) and human name for a cell.
+ */
+export function getCellState(grid: OccupancyGrid, col: number, row: number): { state: number; name: string } {
+  if (col < 0 || col >= grid.width || row < 0 || row >= grid.height) {
+    return { state: -1, name: "Out of Bounds" };
+  }
+  const idx = row * grid.width + col;
+  const s = grid.state ? grid.state[idx] : (grid.data[idx] === 1 ? 2 : 1);
+  const names: Record<number, string> = {
+    0: "Unknown",
+    1: "Free",
+    2: "Occupied",
+    3: "Inflated",
+  };
+  return { state: s, name: names[s] ?? "Unknown" };
+}
+
+/**
+ * Returns clearance distance in metres at point (x, z) from grid.clearance_m if present.
+ */
+export function getCellClearance(grid: OccupancyGrid, x: number, z: number): number {
+  const col = Math.floor((x - grid.origin[0]) / grid.cell_size);
+  const row = Math.floor((z - grid.origin[1]) / grid.cell_size);
+  if (col < 0 || col >= grid.width || row < 0 || row >= grid.height) {
+    return 0;
+  }
+  const idx = row * grid.width + col;
+  const gridAny = grid as unknown as { clearance_m?: number[] };
+  if (gridAny.clearance_m && Array.isArray(gridAny.clearance_m)) {
+    return Number(gridAny.clearance_m[idx] ?? 0);
+  }
+  return 0;
 }
 
 /**

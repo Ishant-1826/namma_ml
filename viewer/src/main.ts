@@ -1,7 +1,14 @@
 import * as THREE from "three";
 import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
 import { FirstPersonControls, EYE_HEIGHT_M } from "./controls";
-import { OccupancyGrid, SceneBounds, isPointInUnknownCell } from "./collision";
+import {
+  OccupancyGrid,
+  SceneBounds,
+  isPointInUnknownCell,
+  worldToCell,
+  getCellState,
+  getCellClearance,
+} from "./collision";
 import { Minimap } from "./minimap";
 
 // Asset base from Vite env (default empty = same origin)
@@ -43,17 +50,17 @@ const QUALITY_PRESETS: Record<QualityTier, QualityConfig> = {
     name: "low",
     label: "Low (0.5x)",
     resScale: 0.5,
-    sparkLodSplatScale: 0.5,
-    sparkLodRenderScale: 2.0,
-    sparkMaxStdDev: 2.0,
+    sparkLodSplatScale: 1.2,
+    sparkLodRenderScale: 0.8,
+    sparkMaxStdDev: 1.75,
   },
   med: {
     name: "med",
     label: "Med (0.75x)",
     resScale: 0.75,
-    sparkLodSplatScale: 0.75,
-    sparkLodRenderScale: 1.5,
-    sparkMaxStdDev: 2.45,
+    sparkLodSplatScale: 1.0,
+    sparkLodRenderScale: 1.0,
+    sparkMaxStdDev: 1.75,
   },
   high: {
     name: "high",
@@ -61,7 +68,7 @@ const QUALITY_PRESETS: Record<QualityTier, QualityConfig> = {
     resScale: 1.0,
     sparkLodSplatScale: 1.0,
     sparkLodRenderScale: 1.0,
-    sparkMaxStdDev: Math.sqrt(8), // Spark default ~2.828
+    sparkMaxStdDev: 1.75,
   },
 };
 
@@ -119,6 +126,16 @@ const statsCollisionVal = document.getElementById("stats-collision") as HTMLSpan
 const statsHeadbobVal = document.getElementById("stats-headbob") as HTMLSpanElement;
 const statsMinimapVal = document.getElementById("stats-minimap") as HTMLSpanElement;
 const statsExploreVal = document.getElementById("stats-explore") as HTMLSpanElement;
+const statsCellVal = document.getElementById("stats-cell") as HTMLSpanElement;
+const statsStateVal = document.getElementById("stats-state") as HTMLSpanElement;
+const statsClearanceVal = document.getElementById("stats-clearance") as HTMLSpanElement;
+const statsBlockerVal = document.getElementById("stats-blocker") as HTMLSpanElement;
+const statsOverlayVal = document.getElementById("stats-overlay") as HTMLSpanElement;
+
+// Collision overlay variables (Translucent red instanced columns, Key G)
+let collisionOverlayMesh: THREE.InstancedMesh | null = null;
+const overlayDummy = new THREE.Object3D();
+const MAX_OVERLAY_INSTANCES = 6000;
 
 const loadingOverlay = document.getElementById("loading-overlay") as HTMLDivElement;
 const loadingSubtitle = document.getElementById("loading-subtitle") as HTMLDivElement;
@@ -212,11 +229,7 @@ function applyQualitySettings(tier: QualityTier) {
 
   // Apply Spark LOD / Splat Detail API properties if available
   if (spark) {
-    const sparkAny = spark as unknown as {
-      lodSplatScale?: number;
-      lodRenderScale?: number;
-      maxStdDev?: number;
-    };
+    const sparkAny = spark as unknown as Record<string, unknown>;
     if ("lodSplatScale" in spark) {
       sparkAny.lodSplatScale = cfg.sparkLodSplatScale;
     }
@@ -225,6 +238,9 @@ function applyQualitySettings(tier: QualityTier) {
     }
     if ("maxStdDev" in spark) {
       sparkAny.maxStdDev = cfg.sparkMaxStdDev;
+    }
+    if ("maxScreenSpaceSplatSize" in spark) {
+      sparkAny.maxScreenSpaceSplatSize = 1024;
     }
   }
 
@@ -235,8 +251,9 @@ function applyQualitySettings(tier: QualityTier) {
 // Initialize Three.js, SparkRenderer, FirstPersonControls, and Minimap
 function initGraphics() {
   scene = new THREE.Scene();
-  // Keep dark background color (#0b0d12) so empty space does not look broken
-  scene.background = new THREE.Color(0x0b0d12);
+  // Warm dark-neutral architectural tone (#181a20) and subtle distance fog
+  scene.background = new THREE.Color(0x181a20);
+  scene.fog = new THREE.Fog(0x181a20, 16.0, 48.0);
 
   camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.05, 1000);
   clock = new THREE.Clock();
@@ -278,7 +295,14 @@ function initGraphics() {
     statsWalkableVal.textContent = enabled ? "ON" : "OFF";
   };
   controls.onExploreUnknownChange = (enabled) => {
-    statsExploreVal.textContent = enabled ? "ON (Key U)" : "OFF (Key U)";
+    statsExploreVal.textContent = enabled ? "ON - Explore (Key U)" : "OFF - Strict (Key U)";
+    updateCollisionOverlayInstances();
+  };
+  controls.onCollisionOverlayChange = (visible) => {
+    statsOverlayVal.textContent = visible ? "ON (Key G)" : "OFF (Key G)";
+    if (collisionOverlayMesh) {
+      collisionOverlayMesh.visible = visible;
+    }
   };
 
   // Lock / touch state listener: toggle overlay & crosshair
@@ -360,7 +384,15 @@ function initGraphics() {
       const limit = controls.toggleWalkableLimit();
       statsWalkableVal.textContent = limit ? "ON" : "OFF";
     } else if (e.code === "KeyU") {
-      statsExploreVal.textContent = controls.exploreUnknown ? "ON (Key U)" : "OFF (Key U)";
+      statsExploreVal.textContent = controls.exploreUnknown ? "ON - Explore (Key U)" : "OFF - Strict (Key U)";
+      updateCollisionOverlayInstances();
+    } else if (e.code === "KeyG") {
+      statsOverlayVal.textContent = controls.collisionOverlayVisible ? "ON (Key G)" : "OFF (Key G)";
+      if (collisionOverlayMesh) {
+        collisionOverlayMesh.visible = controls.collisionOverlayVisible;
+      }
+    } else if (e.code === "KeyF" || e.key === "f" || e.key === "F") {
+      toggleArchitecturalFloor();
     } else if (e.code === "F3" || e.key === "F3") {
       e.preventDefault();
       statsPanelVisible = !statsPanelVisible;
@@ -442,9 +474,177 @@ function updateStatsDOM(): void {
   statsQualityVal.textContent = QUALITY_PRESETS[activeQualityTier].label;
   statsWalkableVal.textContent = controls.limitToWalkable ? "ON" : "OFF";
   statsCollisionVal.textContent = currentOccupancy ? `ON (r=${controls.playerRadius}m)` : "OFF";
+  statsOverlayVal.textContent = controls.collisionOverlayVisible ? "ON (Key G)" : "OFF (Key G)";
   statsHeadbobVal.textContent = controls.headBobEnabled ? "ON (Key H)" : "OFF (Key H)";
   statsMinimapVal.textContent = minimap.isVisible ? "ON (Key B)" : "OFF (Key B)";
-  statsExploreVal.textContent = controls.exploreUnknown ? "ON (Key U)" : "OFF (Key U)";
+  statsExploreVal.textContent = controls.exploreUnknown ? "ON - Explore (Key U)" : "OFF - Strict (Key U)";
+
+  if (currentOccupancy) {
+    const cell = worldToCell(
+      currentOccupancy.origin[0],
+      currentOccupancy.origin[1],
+      currentOccupancy.cell_size,
+      camera.position.x,
+      camera.position.z
+    );
+    statsCellVal.textContent = `(${cell.col}, ${cell.row})`;
+    const st = getCellState(currentOccupancy, cell.col, cell.row);
+    statsStateVal.textContent = `${st.name} (${st.state})`;
+    const clr = getCellClearance(currentOccupancy, camera.position.x, camera.position.z);
+    statsClearanceVal.textContent = `${clr.toFixed(2)} m`;
+  } else {
+    statsCellVal.textContent = "—";
+    statsStateVal.textContent = "—";
+    statsClearanceVal.textContent = "—";
+  }
+
+  const blocker = controls.lastBlockingCell;
+  statsBlockerVal.textContent = blocker ? `(${blocker.col}, ${blocker.row})` : "—";
+}
+
+// Setup InstancedMesh collision overlay (columns y=0 to y=1.2 m, #FF2244, opacity ~0.35)
+function setupCollisionOverlay(grid: OccupancyGrid): void {
+  if (collisionOverlayMesh) {
+    scene.remove(collisionOverlayMesh);
+    collisionOverlayMesh.geometry.dispose();
+    if (Array.isArray(collisionOverlayMesh.material)) {
+      collisionOverlayMesh.material.forEach((m) => m.dispose());
+    } else {
+      collisionOverlayMesh.material.dispose();
+    }
+    collisionOverlayMesh = null;
+  }
+
+  const cellSize = grid.cell_size;
+  // Box geometry from y=0 to y=1.2 m, width and depth = cellSize * 0.95
+  const geom = new THREE.BoxGeometry(cellSize * 0.95, 1.2, cellSize * 0.95);
+  const mat = new THREE.MeshBasicMaterial({
+    color: 0xff2244,
+    transparent: true,
+    opacity: 0.35,
+    depthWrite: false,
+  });
+
+  collisionOverlayMesh = new THREE.InstancedMesh(geom, mat, MAX_OVERLAY_INSTANCES);
+  collisionOverlayMesh.visible = controls.collisionOverlayVisible;
+  collisionOverlayMesh.renderOrder = 999;
+  scene.add(collisionOverlayMesh);
+
+  updateCollisionOverlayInstances();
+}
+
+function updateCollisionOverlayInstances(): void {
+  if (!collisionOverlayMesh || !currentOccupancy) return;
+
+  const grid = currentOccupancy;
+  const originX = grid.origin[0];
+  const originZ = grid.origin[1];
+  const cellSize = grid.cell_size;
+  const isExplore = controls.exploreUnknown;
+
+  // In explore mode: only occupied (state 2) and inflated (state 3) block
+  // In strict mode (!isExplore): occupied (2), inflated (3), and unknown (0) block
+  const blockedCells: Array<[number, number]> = [];
+  const total = grid.width * grid.height;
+  for (let idx = 0; idx < total; idx++) {
+    const col = idx % grid.width;
+    const row = Math.floor(idx / grid.width);
+    const s = grid.state ? grid.state[idx] : (grid.data[idx] === 1 ? 2 : 1);
+    if (s === 2 || s === 3 || (!isExplore && s === 0)) {
+      blockedCells.push([col, row]);
+    }
+  }
+
+  const count = blockedCells.length;
+  const numInstances = Math.min(count, MAX_OVERLAY_INSTANCES);
+  const step = count > MAX_OVERLAY_INSTANCES ? count / MAX_OVERLAY_INSTANCES : 1.0;
+
+  for (let i = 0; i < numInstances; i++) {
+    const srcIdx = Math.floor(i * step);
+    const [col, row] = blockedCells[srcIdx];
+    const wx = originX + (col + 0.5) * cellSize;
+    const wz = originZ + (row + 0.5) * cellSize;
+    overlayDummy.position.set(wx, 0.6, wz);
+    overlayDummy.updateMatrix();
+    collisionOverlayMesh.setMatrixAt(i, overlayDummy.matrix);
+  }
+
+  // Move remaining unused instances out of sight
+  overlayDummy.position.set(0, -9999, 0);
+  overlayDummy.updateMatrix();
+  for (let i = numInstances; i < MAX_OVERLAY_INSTANCES; i++) {
+    collisionOverlayMesh.setMatrixAt(i, overlayDummy.matrix);
+  }
+
+  collisionOverlayMesh.count = numInstances;
+  collisionOverlayMesh.instanceMatrix.needsUpdate = true;
+  console.log(`[Viewer] Updated collision overlay: ${numInstances} instances displayed (mode: ${isExplore ? "Explore" : "Strict"})`);
+}
+
+// Architectural Floor Plane (Matte tile grey #2a2d34 with 0.6m tile lines, Key F, default ON)
+let architecturalFloorGroup: THREE.Group | null = null;
+let architecturalFloorVisible = true;
+
+function setupArchitecturalFloor(manifest: SceneManifest): void {
+  if (architecturalFloorGroup) {
+    scene.remove(architecturalFloorGroup);
+    architecturalFloorGroup.traverse((obj) => {
+      if (obj instanceof THREE.Mesh) {
+        obj.geometry.dispose();
+        if (Array.isArray(obj.material)) {
+          obj.material.forEach((m) => m.dispose());
+        } else {
+          obj.material.dispose();
+        }
+      }
+    });
+    architecturalFloorGroup = null;
+  }
+
+  architecturalFloorGroup = new THREE.Group();
+  architecturalFloorGroup.name = "architectural-floor";
+
+  const b = manifest.bounds;
+  const minX = b.min[0];
+  const maxX = b.max[0];
+  const minZ = b.min[2];
+  const maxZ = b.max[2];
+  const widthX = Math.max(1.0, maxX - minX + 2.0);
+  const lengthZ = Math.max(1.0, maxZ - minZ + 2.0);
+  const midX = (minX + maxX) / 2.0;
+  const midZ = (minZ + maxZ) / 2.0;
+  const floorY = (manifest.floor_y ?? 0.0) - 0.02;
+
+  // 1. Matte tile grey base plane (#2a2d34)
+  const planeGeom = new THREE.PlaneGeometry(widthX, lengthZ);
+  const planeMat = new THREE.MeshBasicMaterial({
+    color: 0x2a2d34,
+    depthWrite: true,
+  });
+  const planeMesh = new THREE.Mesh(planeGeom, planeMat);
+  planeMesh.rotation.x = -Math.PI / 2;
+  planeMesh.position.set(midX, floorY, midZ);
+  architecturalFloorGroup.add(planeMesh);
+
+  // 2. Subtle 0.6m tile grid lines (#3d424e / #343842)
+  const maxDim = Math.max(widthX, lengthZ);
+  const divisions = Math.max(1, Math.round(maxDim / 0.6));
+  const gridHelper = new THREE.GridHelper(maxDim, divisions, 0x3d424e, 0x343842);
+  gridHelper.position.set(midX, floorY + 0.001, midZ);
+  architecturalFloorGroup.add(gridHelper);
+
+  architecturalFloorGroup.visible = architecturalFloorVisible;
+  scene.add(architecturalFloorGroup);
+  console.log(`[Viewer] Architectural floor plane created at y=${floorY.toFixed(3)}m (${widthX.toFixed(1)}m x ${lengthZ.toFixed(1)}m, tile lines: 0.6m)`);
+}
+
+function toggleArchitecturalFloor(): boolean {
+  architecturalFloorVisible = !architecturalFloorVisible;
+  if (architecturalFloorGroup) {
+    architecturalFloorGroup.visible = architecturalFloorVisible;
+  }
+  console.log(`[Viewer] Architectural floor plane (Key F): ${architecturalFloorVisible ? "ON" : "OFF"}`);
+  return architecturalFloorVisible;
 }
 
 // Fetch Manifest, Load Occupancy Grid, and Load Splat Assets
@@ -462,6 +662,7 @@ async function loadScene() {
     currentManifest = manifest;
     expectedSplatsCount = manifest.splat_count || 0;
     controls.setSceneBounds(manifest.bounds);
+    setupArchitecturalFloor(manifest);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[Viewer] Failed to fetch scene manifest from ${sceneJsonUrl}:`, err);
@@ -479,6 +680,7 @@ async function loadScene() {
       currentOccupancy = occData as OccupancyGrid;
       controls.setGrid(currentOccupancy);
       minimap.setGrid(currentOccupancy);
+      setupCollisionOverlay(currentOccupancy);
       console.log(
         `[Viewer] Occupancy grid loaded: ${occData.width}x${occData.height} cells, ` +
         `cell_size=${occData.cell_size}m, origin=[${occData.origin.join(", ")}], ` +

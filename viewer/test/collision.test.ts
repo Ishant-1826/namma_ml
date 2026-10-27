@@ -12,6 +12,8 @@ import {
   fixSpawnPosition,
   clampToBounds,
   getDistanceToFree,
+  getCellState,
+  getCellClearance,
 } from "../src/collision";
 
 /**
@@ -440,6 +442,227 @@ describe("Phase 8 Collision Detection & Sliding Maths", () => {
       expect(isPointInUnknownCell(grid, 0.45, 0.25)).toBe(false);
       // Outside grid -> false
       expect(isPointInUnknownCell(grid, -1.0, 0.25)).toBe(false);
+    });
+  });
+
+  describe("13. Q4 Required Acceptance Tests", () => {
+    // 10x10 synthetic grid with various cell states:
+    // col 0..2: free (state 1, data 0)
+    // col 3..4: unknown (state 0, data 1)
+    // col 5: occupied (state 2, data 1)
+    // col 6: inflated (state 3, data 1)
+    const width = 10;
+    const height = 10;
+    const state = new Uint8Array(width * height);
+    const data = new Uint8Array(width * height);
+    const walkable = new Uint8Array(width * height);
+
+    for (let r = 0; r < height; r++) {
+      for (let c = 0; c < width; c++) {
+        const idx = r * width + c;
+        if (c <= 2) {
+          state[idx] = 1; // free
+          data[idx] = 0;
+          walkable[idx] = 1;
+        } else if (c <= 4) {
+          state[idx] = 0; // unknown
+          data[idx] = 1;
+          walkable[idx] = 0;
+        } else if (c === 5) {
+          state[idx] = 2; // occupied
+          data[idx] = 1;
+          walkable[idx] = 0;
+        } else if (c === 6) {
+          state[idx] = 3; // inflated
+          data[idx] = 1;
+          walkable[idx] = 0;
+        } else {
+          state[idx] = 1; // free
+          data[idx] = 0;
+          walkable[idx] = 1;
+        }
+      }
+    }
+
+    const testGrid: OccupancyGrid = {
+      origin: [0, 0],
+      cell_size: 0.1,
+      width,
+      height,
+      data,
+      walkable,
+      state,
+    };
+
+    it("(a) unknown cell is passable by default (allowUnknown = true)", () => {
+      // Cell (col 3, row 3) is unknown (state 0)
+      // When allowUnknown is omitted (defaulting to true), isBlocked must return false
+      expect(isBlocked(testGrid, 3, 3)).toBe(false);
+      expect(isPointBlocked(testGrid, 0.35, 0.35)).toBe(false);
+      expect(isCircleBlocked(testGrid, 0.35, 0.35, RADIUS)).toBe(false);
+
+      // Moving from free cell (0.25, 0.35) into unknown cell (0.35, 0.35) is allowed by default
+      const res = resolveMovement(testGrid, 0.25, 0.35, 0.10, 0.0, RADIUS);
+      expect(res.x).toBeCloseTo(0.35, 3);
+      expect(res.hitX).toBe(false);
+    });
+
+    it("(b) unknown cell is blocked in strict mode (allowUnknown = false)", () => {
+      // In strict mode (allowUnknown = false), unknown cells (state 0) must block
+      expect(isBlocked(testGrid, 3, 3, false, false)).toBe(true);
+      expect(isPointBlocked(testGrid, 0.35, 0.35, false, false)).toBe(true);
+      expect(isCircleBlocked(testGrid, 0.35, 0.35, RADIUS, false, false)).toBe(true);
+
+      // Moving towards unknown cell (starting at free cell 0.15, moving +X towards col 3 at x=0.30)
+      const res = resolveMovement(testGrid, 0.15, 0.35, 0.20, 0.0, RADIUS, false, false);
+      expect(res.hitX).toBe(true);
+      expect(res.x).toBeLessThanOrEqual(0.2201);
+      expect(res.lastBlockingCell).toBeDefined();
+      expect(res.lastBlockingCell?.col).toBe(3);
+    });
+
+    it("(c) occupied cell (state 2) and inflated cell (state 3) are blocked in BOTH modes", () => {
+      // col 5 is occupied (state 2), col 6 is inflated (state 3)
+      // Mode 1: Default / Explore mode (allowUnknown = true)
+      expect(isBlocked(testGrid, 5, 3, false, true)).toBe(true);
+      expect(isBlocked(testGrid, 6, 3, false, true)).toBe(true);
+      expect(isPointBlocked(testGrid, 0.55, 0.35, false, true)).toBe(true);
+      expect(isPointBlocked(testGrid, 0.65, 0.35, false, true)).toBe(true);
+
+      // Mode 2: Strict mode (allowUnknown = false)
+      expect(isBlocked(testGrid, 5, 3, false, false)).toBe(true);
+      expect(isBlocked(testGrid, 6, 3, false, false)).toBe(true);
+      expect(isPointBlocked(testGrid, 0.55, 0.35, false, false)).toBe(true);
+      expect(isPointBlocked(testGrid, 0.65, 0.35, false, false)).toBe(true);
+
+      // Movement into occupied cell is blocked in both modes
+      const resOccExplore = resolveMovement(testGrid, 0.40, 0.35, 0.20, 0.0, RADIUS, false, true);
+      expect(resOccExplore.hitX).toBe(true);
+      expect(resOccExplore.x).toBeLessThanOrEqual(0.4201);
+
+      const resOccStrict = resolveMovement(testGrid, 0.40, 0.35, 0.20, 0.0, RADIUS, false, false);
+      expect(resOccStrict.hitX).toBe(true);
+    });
+
+    it("(d) 0.35 m gap between two 0.10 m walls (with 0.08 m player radius and 0.07 m inflation buffer) is passable", () => {
+      // Create a corridor grid with cell_size = 0.025 m (25 mm precision)
+      // Wall 1 (0.10 m thick): x in [0.90, 1.00] m (cols 36..39 at row 20)
+      // Wall 2 (0.10 m thick): x in [1.35, 1.45] m (cols 54..57 at row 20)
+      // Gap width = 1.35 - 1.00 = 0.35 m between the two walls
+      // Inflation buffer = 0.07 m:
+      // - Cells within 0.07 m of Wall 1 (cols 40..42, up to x = 1.075 m) are inflated (state 3)
+      // - Cells within 0.07 m of Wall 2 (cols 51..53, down to x = 1.275 m) are inflated (state 3)
+      // - Central gap cells (cols 43..50, x in [1.075, 1.275] m) remain FREE (state 1, data 0)
+      const cellSize = 0.025;
+      const w = 100; // 2.5 m
+      const h = 40;  // 1.0 m
+      const corridorState = new Uint8Array(w * h).fill(1); // default all free
+      const corridorData = new Uint8Array(w * h).fill(0);
+      const corridorWalkable = new Uint8Array(w * h).fill(1);
+
+      // Place Pillar 1: cols 36..39 at row 20 (occupied, state 2)
+      for (let c = 36; c <= 39; c++) {
+        corridorState[20 * w + c] = 2;
+        corridorData[20 * w + c] = 1;
+        corridorWalkable[20 * w + c] = 0;
+      }
+      // Place Pillar 2: cols 54..57 at row 20 (occupied, state 2)
+      for (let c = 54; c <= 57; c++) {
+        corridorState[20 * w + c] = 2;
+        corridorData[20 * w + c] = 1;
+        corridorWalkable[20 * w + c] = 0;
+      }
+      // Inflated buffer cells (state 3): cols 40..42 and cols 51..53 at row 20
+      for (let c = 40; c <= 42; c++) {
+        corridorState[20 * w + c] = 3;
+        corridorData[20 * w + c] = 1;
+        corridorWalkable[20 * w + c] = 0;
+      }
+      for (let c = 51; c <= 53; c++) {
+        corridorState[20 * w + c] = 3;
+        corridorData[20 * w + c] = 1;
+        corridorWalkable[20 * w + c] = 0;
+      }
+
+      const corridorGrid: OccupancyGrid = {
+        origin: [0, 0],
+        cell_size: cellSize,
+        width: w,
+        height: h,
+        data: corridorData,
+        walkable: corridorWalkable,
+        state: corridorState,
+      };
+
+      // Player with radius 0.08 m starts before the gap at x = 1.175, z = 0.20 (row 8)
+      // and walks through row 20 (z = 0.50) to z = 0.80 (row 32)
+      const playerRadius = 0.08;
+      const res = resolveMovement(corridorGrid, 1.175, 0.20, 0.0, 0.60, playerRadius);
+
+      // The player successfully passes completely through the 0.35 m gap
+      expect(res.z).toBeCloseTo(0.80, 3);
+      expect(res.hitZ).toBe(false);
+
+      // In contrast, an oversized player (radius 0.15 m > half gap clearance) cannot pass
+      const oversizedRes = resolveMovement(corridorGrid, 1.175, 0.20, 0.0, 0.60, 0.15);
+      expect(oversizedRes.hitZ).toBe(true);
+      expect(oversizedRes.z).toBeLessThanOrEqual(0.4201);
+    });
+
+    it("(e) long fast move (e.g. dx = 1.0 m at v = 10 m/s) does not tunnel through a 1-cell wall due to sub-stepping (0.05 m)", () => {
+      // Grid with 1-cell thick wall at col 10 (x = 1.0 to 1.1)
+      const w = 30;
+      const h = 10;
+      const wallData = new Uint8Array(w * h).fill(0);
+      for (let r = 0; r < h; r++) wallData[r * w + 10] = 1;
+
+      const wallGrid: OccupancyGrid = {
+        origin: [0, 0],
+        cell_size: 0.1,
+        width: w,
+        height: h,
+        data: wallData,
+        walkable: new Uint8Array(w * h).fill(1),
+      };
+
+      // Fast move: starting at x = 0.5, moving dx = 1.0 m (target x = 1.5)
+      // Without sub-stepping, starting point (0.5) and endpoint (1.5) are both free!
+      // But with 0.05 m sub-stepping, the collision detection intercepts the wall.
+      const resFast = resolveMovement(wallGrid, 0.5, 0.5, 1.0, 0.0, RADIUS);
+
+      expect(resFast.hitX).toBe(true);
+      expect(resFast.x).toBeLessThanOrEqual(0.9201);
+      expect(resFast.x).toBeGreaterThan(0.5); // Made progress up to the wall
+      expect(resFast.lastBlockingCell?.col).toBe(10);
+    });
+
+    it("evaluates getCellState and getCellClearance telemetry helpers", () => {
+      const freeCell = getCellState(testGrid, 1, 1);
+      expect(freeCell.state).toBe(1);
+      expect(freeCell.name).toBe("Free");
+
+      const unknownCell = getCellState(testGrid, 3, 3);
+      expect(unknownCell.state).toBe(0);
+      expect(unknownCell.name).toBe("Unknown");
+
+      const occCell = getCellState(testGrid, 5, 3);
+      expect(occCell.state).toBe(2);
+      expect(occCell.name).toBe("Occupied");
+
+      const infCell = getCellState(testGrid, 6, 3);
+      expect(infCell.state).toBe(3);
+      expect(infCell.name).toBe("Inflated");
+
+      // Clearance test: returns 0 when clearance_m is omitted, or the exact clearance in metres when present
+      const defaultClearance = getCellClearance(testGrid, 0.15, 0.15);
+      expect(defaultClearance).toBe(0);
+
+      const gridWithClearance: OccupancyGrid = {
+        ...testGrid,
+        clearance_m: [0.75, 0.85],
+      };
+      const clearanceVal = getCellClearance(gridWithClearance, 0.05, 0.05);
+      expect(clearanceVal).toBe(0.75);
     });
   });
 });

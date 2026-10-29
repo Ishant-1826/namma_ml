@@ -18,6 +18,7 @@ venv/
 # === Node / Vite ===
 viewer/node_modules/
 viewer/dist/
+.wrangler/
 
 # === IDE ===
 .vscode/
@@ -47,4 +48,8 @@ Thumbs.db
 *.splat
 *.spz
 
-
+# === Environment & Secrets ===
+.env
+.env.*
+!.env.example
+*.token

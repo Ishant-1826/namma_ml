@@ -356,6 +356,21 @@
     - Splat count verified: logs loaded count (`700,000`) and confirms exact match with `scene.json`.
     - Build: `npm run build` (`tsc && vite build`) passes with ZERO TypeScript errors.
     - Dev server running detached at `http://localhost:5173/`.
+- [x] **Phase 9: Cloudflare Pages Deployment** -- COMPLETE & VERIFIED (2026-10-29):
+  - **Live URL**: `https://namma-ml-viewer.pages.dev/` (and deployment hash `https://75352a0d.namma-ml-viewer.pages.dev/`).
+  - **Architecture**: Static SPA + 3D Gaussian Splatting assets hosted directly on Cloudflare Pages.
+  - **Asset Hygiene & Pages 25 MiB Limit**:
+    - Uncompressed splats (`scene.splat`, `scene.ply`) excluded from `dist/` via `viewer/vite.config.ts`.
+    - Deployed `scene.v1.spz` (8.64 MB), `scene.json` (494 B), `occupancy.json` (406 KB), `occupancy.png` (326 KB), and JS/CSS chunks.
+    - All files verified strictly under the 25 MiB limit (largest asset is 8.64 MB, 34.5% of cap).
+  - **Edge Cache Directives (`_headers`)**:
+    - `/scene/scene.json`: `Cache-Control: public, max-age=60`.
+    - `/scene/*.spz`: `Cache-Control: public, max-age=31536000, immutable`.
+    - HTTP response headers verified via curl directly against Cloudflare edge servers.
+  - **Testing & Verification**:
+    - Full Vitest suite passing (35/35 unit tests in `viewer/test/`).
+    - Cold download latency: ~3.0s total over the wire.
+  - **Deployment Guide**: Comprehensive guide documented in `docs/deploy/README_DEPLOY.md`.
 - [ ] Phase 7b: First-person WASD + pointer-lock roaming controls, eye-height maintenance, and 2D occupancy grid collision detection.
 
 

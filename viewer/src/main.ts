@@ -5,7 +5,7 @@ import { OccupancyGrid, SceneBounds, isPointInUnknownCell } from "./collision";
 import { Minimap } from "./minimap";
 
 // Asset base from Vite env (default empty = same origin)
-const ASSET_BASE = (import.meta.env.VITE_ASSET_BASE || "").replace(/\/+$/, "");
+const ASSET_BASE = (import.meta.env.VITE_ASSET_BASE || "/scene").replace(/\/+$/, "");
 
 export interface SceneManifest {
   scene: string;
@@ -449,7 +449,7 @@ function updateStatsDOM(): void {
 
 // Fetch Manifest, Load Occupancy Grid, and Load Splat Assets
 async function loadScene() {
-  const sceneJsonUrl = `${ASSET_BASE}/scene/scene.json`;
+  const sceneJsonUrl = `${ASSET_BASE}/scene.json`;
   showLoading("scene.json");
 
   let manifest: SceneManifest;
@@ -470,7 +470,7 @@ async function loadScene() {
   }
 
   // Load Occupancy Grid for Phase 8 Movement Constraints and Minimap
-  const occJsonUrl = `${ASSET_BASE}/scene/occupancy.json`;
+  const occJsonUrl = `${ASSET_BASE}/occupancy.json`;
   try {
     console.log(`[Viewer] Loading occupancy grid from ${occJsonUrl}`);
     const occRes = await fetch(occJsonUrl);
@@ -502,8 +502,8 @@ async function loadScene() {
   const spzFileName = manifest.splat_files?.spz || "scene.spz";
   const splatFileName = manifest.splat_files?.splat || manifest.splat_file || "scene.splat";
 
-  const spzUrl = `${ASSET_BASE}/scene/${spzFileName}`;
-  const splatUrl = `${ASSET_BASE}/scene/${splatFileName}`;
+  const spzUrl = `${ASSET_BASE}/${spzFileName}`;
+  const splatUrl = `${ASSET_BASE}/${splatFileName}`;
 
   if (currentSplatMesh) {
     scene.remove(currentSplatMesh);
@@ -531,7 +531,16 @@ async function loadScene() {
     durationMs = performance.now() - tStartSpz;
     console.log(`[Viewer] Successfully loaded .spz in ${durationMs.toFixed(1)} ms`);
   } catch (spzError) {
-    console.warn(`[Viewer] .spz loading failed from ${spzUrl}. Falling back to .splat...`, spzError);
+    console.warn(`[Viewer] .spz loading failed from ${spzUrl}.`, spzError);
+
+    // Keep .splat fallback only for local dev (when ASSET_BASE is local "/scene" and not production)
+    const isLocalDev = !import.meta.env.PROD && (ASSET_BASE === "/scene" || !ASSET_BASE.startsWith("http"));
+    if (!isLocalDev) {
+      console.error(`[Viewer] .spz loading failed in production from ${spzUrl}:`, spzError);
+      const msg = spzError instanceof Error ? spzError.message : String(spzError);
+      showError(spzUrl, `Failed to load scene splat (.spz): ${msg}`);
+      return;
+    }
 
     // Attempt 2: Fall back to .splat
     showLoading(splatFileName);

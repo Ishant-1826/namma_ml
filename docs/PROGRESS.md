@@ -56,6 +56,7 @@ R7. After every stage update docs/PROGRESS.md and docs/STATE.md. UI stays
 | **Stage F (v3.1): Occupancy v3.1** | Completed | 2026-10-27 00:03 | 2026-10-27 00:04 | Camera path carving (r=0.20m, 446 cams + segments <0.5m); 362 cand / 34 v3 floater cells overridden (0 with >=10 voxels); cam walkable 100.00% (446/446); path blocked-step 0.00%; synthetic test PASSED; assets deployed |
 | **Stage G: Final Check & Report** | Completed | 2026-10-26 19:35 | 2026-10-26 19:36 | Vite production build PASSED (4.66s); Vitest 27/27 tests PASSED; powercfg restored to 30 min |
 | **Stage H: Viewer Refinements** | Completed | 2026-10-27 00:12 | 2026-10-27 00:15 | Key U explore mode (HUD label 'unreconstructed area'); Spark Low/Med/High quality presets (maxStdDev 2.0/2.45/2.828); Vitest 35/35 PASSED; Vite build PASSED (4.24s); dev server scheduled on port 5173 |
+| **Phase 9: Cloudflare Deployment (Pages Only)** | Completed | 2026-10-29 21:53 | 2026-10-29 22:15 | R2 skipped on purpose (hosting all assets on Pages); project 'namma-ml-viewer' deployed to https://namma-ml-viewer.pages.dev/; all files under 25 MiB (spz 8.64 MB); Cache-Control headers verified; docs/deploy/README_DEPLOY.md written |
 
 ---
 
